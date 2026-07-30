@@ -19,7 +19,6 @@ void Require(bool condition, const std::string& message) {
 
 DistributorConfig TestConfig() {
     DistributorConfig config;
-    config.run_id = "test-run";
     config.max_queue_samples = 10000;
     config.max_queue_fragments = 100;
     config.max_queue_estimated_bytes = 64 * 1024 * 1024;
@@ -36,7 +35,6 @@ maze::SampleBatch MakeBatch(const std::string& batch_id,
                             int version = 0,
                             int64_t first_frame = 0) {
     maze::SampleBatch batch;
-    batch.set_run_id("test-run");
     batch.set_aiserver_id("aiserver-0");
     batch.set_env_id("env-0");
     batch.set_session_id(0);
@@ -49,7 +47,7 @@ maze::SampleBatch MakeBatch(const std::string& batch_id,
     batch.set_producer_instance_id("producer-0");
     batch.set_fragment_seq(sequence);
     batch.set_batch_id(batch_id);
-    batch.set_protocol_version(2);
+    batch.set_protocol_version(3);
     batch.set_termination_reason(maze::TERMINATION_REASON_ACTIVE);
     batch.set_bootstrap_value(0.25f);
     batch.set_bootstrap_valid(true);
@@ -85,7 +83,6 @@ maze::GetBatchRsp Get(
         maze::BATCH_SELECTION_POLICY_TARGET_ONLY,
     const std::string& consumer = "consumer-0") {
     maze::GetBatchReq request;
-    request.set_run_id("test-run");
     request.set_consumer_instance_id(consumer);
     request.set_batch_size(target);
     request.set_timeout_ms(timeout_ms);
@@ -104,7 +101,6 @@ maze::DeliveryRsp Ack(
     const std::string& train_update_id = "",
     const std::string& consumer = "consumer-0") {
     maze::AckBatchReq request;
-    request.set_run_id("test-run");
     request.set_consumer_instance_id(consumer);
     request.set_delivery_id(delivery_id);
     request.set_disposition(disposition);
@@ -205,7 +201,6 @@ void TestTargetOnlyDoesNotReturnPartial() {
             "DRAIN_AVAILABLE may lease a partial batch");
 
     maze::NackBatchReq nack;
-    nack.set_run_id("test-run");
     nack.set_consumer_instance_id("consumer-0");
     nack.set_delivery_id(drain.delivery_id());
     nack.set_reason("contract test");
@@ -231,7 +226,6 @@ void TestRenewAndExpiry() {
             "initial lease");
 
     maze::RenewLeaseReq renew;
-    renew.set_run_id("test-run");
     renew.set_consumer_instance_id("consumer-0");
     renew.set_delivery_id(first.delivery_id());
     renew.set_lease_timeout_ms(100);

@@ -45,22 +45,8 @@ bool SampleStore::IsSha256(const std::string& value) {
     return true;
 }
 
-bool SampleStore::ValidateRunLocked(const std::string& run_id,
-                                    std::string* error) const {
-    if (run_id.empty()) {
-        *error = "run_id is required";
-        return false;
-    }
-    if (run_id != config_.run_id) {
-        *error = "run_id does not match active run";
-        return false;
-    }
-    return true;
-}
-
 bool SampleStore::ValidateBatchLocked(const maze::SampleBatch& batch,
                                       std::string* error) const {
-    if (!ValidateRunLocked(batch.run_id(), error)) return false;
     if (batch.protocol_version() != kProtocolVersion) {
         *error = "unsupported protocol_version";
         return false;
@@ -132,6 +118,12 @@ bool SampleStore::ValidateBatchLocked(const maze::SampleBatch& batch,
         return false;
     }
     return true;
+}
+
+bool SampleStore::DeliveryBelongsToInstanceLocked(
+    const std::string& delivery_id) const {
+    const std::string prefix = instance_id_ + "-delivery-";
+    return delivery_id.rfind(prefix, 0) == 0;
 }
 
 bool SampleStore::CapacityAllowsLocked(int64_t samples,
@@ -246,10 +238,7 @@ void SampleStore::Push(const maze::SampleBatch& batch,
             last_error_ = error;
             response->set_ret_code(-1);
             response->set_message(error);
-            response->set_result(
-                batch.run_id() == config_.run_id
-                    ? maze::PUSH_RESULT_REJECTED_INVALID
-                    : maze::PUSH_RESULT_REJECTED_RUN);
+            response->set_result(maze::PUSH_RESULT_REJECTED_INVALID);
         } else if (accepted_batch_ids_.find(batch.batch_id()) !=
                    accepted_batch_ids_.end()) {
             ++duplicate_push_attempt_count_;
@@ -329,16 +318,13 @@ void SampleStore::GetBatch(
     response->set_distributor_instance_id(instance_id_);
     response->set_behavior_model_version(version);
 
-    std::string error;
-    if (!ValidateRunLocked(request.run_id(), &error) ||
-        request.consumer_instance_id().empty() || target_samples <= 0 ||
+    if (request.consumer_instance_id().empty() || target_samples <= 0 ||
         timeout_ms <= 0 || lease_timeout_ms <= 0 || version < 0 ||
         (policy != maze::BATCH_SELECTION_POLICY_TARGET_ONLY &&
          policy != maze::BATCH_SELECTION_POLICY_DRAIN_AVAILABLE)) {
         response->set_ret_code(-1);
         response->set_result(maze::GET_BATCH_RESULT_REJECTED);
-        response->set_message(
-            error.empty() ? "invalid GetBatch request" : error);
+        response->set_message("invalid GetBatch request");
         response->set_queue_size(ready_samples_);
         return;
     }
@@ -474,18 +460,22 @@ void SampleStore::Ack(const maze::AckBatchReq& request,
     response->set_delivery_id(request.delivery_id());
     FillDeliveryResponseLocked(response);
 
-    std::string error;
     const bool trained =
         request.disposition() == maze::ACK_DISPOSITION_TRAINED;
-    if (!ValidateRunLocked(request.run_id(), &error) ||
-        request.consumer_instance_id().empty() ||
+    if (request.consumer_instance_id().empty() ||
         request.delivery_id().empty() ||
         request.disposition() == maze::ACK_DISPOSITION_UNSPECIFIED ||
         (trained && request.train_update_id().empty())) {
         response->set_ret_code(-1);
         response->set_result(maze::DELIVERY_RESULT_REJECTED);
+        response->set_message("invalid AckBatch request");
+        return;
+    }
+    if (!DeliveryBelongsToInstanceLocked(request.delivery_id())) {
+        response->set_ret_code(-1);
+        response->set_result(maze::DELIVERY_RESULT_REJECTED);
         response->set_message(
-            error.empty() ? "invalid AckBatch request" : error);
+            "delivery belongs to another distributor instance");
         return;
     }
 
@@ -588,14 +578,18 @@ void SampleStore::Nack(const maze::NackBatchReq& request,
     response->set_delivery_id(request.delivery_id());
     FillDeliveryResponseLocked(response);
 
-    std::string error;
-    if (!ValidateRunLocked(request.run_id(), &error) ||
-        request.consumer_instance_id().empty() ||
+    if (request.consumer_instance_id().empty() ||
         request.delivery_id().empty()) {
         response->set_ret_code(-1);
         response->set_result(maze::DELIVERY_RESULT_REJECTED);
+        response->set_message("invalid NackBatch request");
+        return;
+    }
+    if (!DeliveryBelongsToInstanceLocked(request.delivery_id())) {
+        response->set_ret_code(-1);
+        response->set_result(maze::DELIVERY_RESULT_REJECTED);
         response->set_message(
-            error.empty() ? "invalid NackBatch request" : error);
+            "delivery belongs to another distributor instance");
         return;
     }
     const DeliveryRecord* history =
@@ -639,14 +633,18 @@ void SampleStore::RenewLease(const maze::RenewLeaseReq& request,
     response->set_delivery_id(request.delivery_id());
     FillDeliveryResponseLocked(response);
 
-    std::string error;
-    if (!ValidateRunLocked(request.run_id(), &error) ||
-        request.consumer_instance_id().empty() ||
+    if (request.consumer_instance_id().empty() ||
         request.delivery_id().empty() || request.lease_timeout_ms() <= 0) {
         response->set_ret_code(-1);
         response->set_result(maze::DELIVERY_RESULT_REJECTED);
+        response->set_message("invalid RenewLease request");
+        return;
+    }
+    if (!DeliveryBelongsToInstanceLocked(request.delivery_id())) {
+        response->set_ret_code(-1);
+        response->set_result(maze::DELIVERY_RESULT_REJECTED);
         response->set_message(
-            error.empty() ? "invalid RenewLease request" : error);
+            "delivery belongs to another distributor instance");
         return;
     }
     const DeliveryRecord* history =
@@ -693,7 +691,6 @@ void SampleStore::FillStatusLocked(
     response->set_latest_push_ts_ms(latest_push_ts_ms_);
     response->set_latest_consume_ts_ms(latest_consume_ts_ms_);
     response->set_protocol_version(kProtocolVersion);
-    response->set_run_id(config_.run_id);
     response->set_distributor_instance_id(instance_id_);
     response->set_ready(true);
     response->set_push_attempt_count(push_attempt_count_);
@@ -752,13 +749,10 @@ void SampleStore::FillStatusLocked(
 
 void SampleStore::GetStatus(const maze::DistributorStatusReq& request,
                             maze::DistributorStatusRsp* response) {
+    (void)request;
     std::lock_guard<std::mutex> lock(mutex_);
     ReclaimExpiredLeaseLocked();
     FillStatusLocked(response);
-    if (!request.run_id().empty() && request.run_id() != config_.run_id) {
-        response->set_ready(false);
-        response->set_last_error("run_id does not match active run");
-    }
 }
 
 const std::string& SampleStore::instance_id() const {

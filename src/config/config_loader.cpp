@@ -127,10 +127,6 @@ bool LoadDistributorConfig(const std::string& yaml_path, DistributorConfig& out_
     std::vector<YamlEntry> entries = ParseYaml(ss.str());
 
     out_config.listen_port = SafeInt(FindValue(entries, "server", "listen_port"), 9100);
-    std::string run_id = FindValue(entries, "server", "run_id");
-    if (!run_id.empty()) {
-        out_config.run_id = run_id;
-    }
 
     out_config.max_queue_samples = SafeInt64(
         FindValue(entries, "queue", "max_queue_samples"), 262144);
@@ -152,10 +148,6 @@ bool LoadDistributorConfig(const std::string& yaml_path, DistributorConfig& out_
     std::string env_port = GetEnvValue("MAZE_SAMPLE_DISTRIBUTOR_PORT");
     if (!env_port.empty()) {
         out_config.listen_port = SafeInt(env_port, out_config.listen_port);
-    }
-    std::string env_run_id = GetEnvValue("MAZE_RUN_ID");
-    if (!env_run_id.empty()) {
-        out_config.run_id = env_run_id;
     }
     std::string env_max_samples = GetEnvValue("MAZE_DISTRIBUTOR_MAX_SAMPLES");
     if (!env_max_samples.empty()) {

@@ -5,7 +5,6 @@
 
 struct DistributorConfig {
     int listen_port = 9100;
-    std::string run_id = "local-run";
     int64_t max_queue_samples = 262144;
     int64_t max_queue_fragments = 4096;
     int64_t max_queue_estimated_bytes = 536870912;

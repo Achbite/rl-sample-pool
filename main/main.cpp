@@ -36,8 +36,8 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "[SampleDistributor] listening on " << listen_addr << std::endl;
-    std::cout << "[SampleDistributor] run_id=" << config.run_id
-              << ", instance_id=" << service.instance_id() << std::endl;
+    std::cout << "[SampleDistributor] instance_id="
+              << service.instance_id() << std::endl;
     std::cout << "[SampleDistributor] max_queue_samples="
               << config.max_queue_samples
               << ", max_queue_fragments="

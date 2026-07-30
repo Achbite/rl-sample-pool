@@ -1,6 +1,5 @@
 server:
   listen_port: 9100
-  run_id: "local-run"
 
 queue:
   max_queue_samples: 262144

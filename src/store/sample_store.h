@@ -69,7 +69,7 @@ private:
         int64_t shutdown_untrained_samples = 0;
     };
 
-    static constexpr uint32_t kProtocolVersion = 2;
+    static constexpr uint32_t kProtocolVersion = 3;
 
     static int64_t NowMs();
     static std::string CreateInstanceId(const std::string& prefix);
@@ -77,10 +77,10 @@ private:
     static int64_t EstimateBytes(const maze::SampleBatch& batch);
     static bool IsSha256(const std::string& value);
 
-    bool ValidateRunLocked(const std::string& run_id,
-                           std::string* error) const;
     bool ValidateBatchLocked(const maze::SampleBatch& batch,
                              std::string* error) const;
+    bool DeliveryBelongsToInstanceLocked(
+        const std::string& delivery_id) const;
     bool CapacityAllowsLocked(int64_t samples,
                               int64_t fragments,
                               int64_t estimated_bytes) const;
