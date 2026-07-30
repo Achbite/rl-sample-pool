@@ -1,0 +1,19 @@
+FROM python:3.11-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    ninja-build \
+    protobuf-compiler \
+    libprotobuf-dev \
+    libgrpc++-dev \
+    protobuf-compiler-grpc \
+    libabsl-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+CMD ["bash"]

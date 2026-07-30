@@ -1,0 +1,62 @@
+cmake_minimum_required(VERSION 3.16)
+project(maze_sample_distributor LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+find_package(Protobuf REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GRPC REQUIRED grpc++)
+
+set(SOURCES
+    main/main.cpp
+    src/config/config_loader.cpp
+    src/grpc/sample_distributor_service.cpp
+    src/store/sample_store.cpp
+)
+
+set(CONTRACT_CPP_DIR "" CACHE PATH "Directory containing generated C++ bindings")
+if(NOT CONTRACT_CPP_DIR)
+    message(FATAL_ERROR "CONTRACT_CPP_DIR must point to an rl-contracts C++ artifact")
+endif()
+
+set(PROTO_GEN_DIR ${CONTRACT_CPP_DIR})
+set(PROTO_SOURCES
+    ${PROTO_GEN_DIR}/maze.pb.cc
+    ${PROTO_GEN_DIR}/maze.grpc.pb.cc
+)
+
+add_executable(${PROJECT_NAME} ${SOURCES} ${PROTO_SOURCES})
+
+target_include_directories(${PROJECT_NAME} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${PROTO_GEN_DIR}
+    ${Protobuf_INCLUDE_DIRS}
+    ${GRPC_INCLUDE_DIRS}
+)
+
+target_link_libraries(${PROJECT_NAME} PRIVATE
+    protobuf::libprotobuf
+    ${GRPC_LIBRARIES}
+    pthread
+)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(sample_store_test
+        tests/sample_store_test.cpp
+        src/config/config_loader.cpp
+        src/store/sample_store.cpp
+        ${PROTO_GEN_DIR}/maze.pb.cc
+    )
+    target_include_directories(sample_store_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${PROTO_GEN_DIR}
+        ${Protobuf_INCLUDE_DIRS}
+    )
+    target_link_libraries(sample_store_test PRIVATE
+        protobuf::libprotobuf
+        pthread
+    )
+    add_test(NAME sample_store_contract COMMAND sample_store_test)
+endif()
