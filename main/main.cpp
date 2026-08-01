@@ -11,7 +11,7 @@ static const char* kDefaultConfigPath = "configs/distributor_config.yaml";
 
 int main(int argc, char* argv[]) {
     std::cout << "============================================\n";
-    std::cout << "  Maze RL - SampleDistributor\n";
+    std::cout << "  Maze RL - LocalSampleService\n";
     std::cout << "============================================\n\n";
 
     const char* config_path = kDefaultConfigPath;
@@ -35,10 +35,12 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::cout << "[SampleDistributor] listening on " << listen_addr << std::endl;
-    std::cout << "[SampleDistributor] instance_id="
+    std::cout << "[LocalSampleService] listening on " << listen_addr << std::endl;
+    std::cout << "[LocalSampleService] backend=LOCAL_MEMORY"
+              << ", max_concurrent_consumers=1" << std::endl;
+    std::cout << "[LocalSampleService] instance_id="
               << service.instance_id() << std::endl;
-    std::cout << "[SampleDistributor] max_queue_samples="
+    std::cout << "[LocalSampleService] max_queue_samples="
               << config.max_queue_samples
               << ", max_queue_fragments="
               << config.max_queue_fragments

@@ -329,6 +329,7 @@ void SampleStore::GetBatch(
         return;
     }
     if (has_lease_) {
+        ++consumer_busy_count_;
         response->set_ret_code(2);
         response->set_result(maze::GET_BATCH_RESULT_BUSY);
         response->set_message("another delivery is still leased");
@@ -360,6 +361,7 @@ void SampleStore::GetBatch(
                     std::chrono::milliseconds(50)));
         ReclaimExpiredLeaseLocked();
         if (has_lease_) {
+            ++consumer_busy_count_;
             response->set_ret_code(2);
             response->set_result(maze::GET_BATCH_RESULT_BUSY);
             response->set_message("another delivery is still leased");
@@ -730,6 +732,12 @@ void SampleStore::FillStatusLocked(
     response->set_shutdown_untrained_sample_count(
         shutdown_untrained_sample_count_);
     response->set_lease_renew_count(lease_renew_count_);
+    response->set_backend_type(maze::SAMPLE_BACKEND_TYPE_LOCAL_MEMORY);
+    response->set_max_concurrent_consumers(1);
+    response->set_active_consumer_count(has_lease_ ? 1 : 0);
+    response->set_consumer_busy_count(consumer_busy_count_);
+    response->set_ingress_ready(true);
+    response->set_pool_ready(true);
     for (const auto& item : version_counters_) {
         auto* version = response->add_behavior_versions();
         version->set_behavior_model_version(item.first);

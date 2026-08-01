@@ -138,6 +138,7 @@ private:
     int64_t target_hit_count_ = 0;
     int64_t partial_get_count_ = 0;
     int64_t empty_timeout_count_ = 0;
+    int64_t consumer_busy_count_ = 0;
 
     int64_t latest_push_ts_ms_ = 0;
     int64_t latest_consume_ts_ms_ = 0;

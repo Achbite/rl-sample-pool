@@ -33,7 +33,8 @@ maze::SampleBatch MakeBatch(const std::string& batch_id,
                             int samples,
                             uint64_t sequence,
                             int version = 0,
-                            int64_t first_frame = 0) {
+                            int64_t first_frame = 0,
+                            const std::string& producer = "producer-0") {
     maze::SampleBatch batch;
     batch.set_aiserver_id("aiserver-0");
     batch.set_env_id("env-0");
@@ -44,7 +45,7 @@ maze::SampleBatch MakeBatch(const std::string& batch_id,
     batch.set_behavior_model_version(version);
     batch.set_behavior_model_checksum(std::string(64, 'a' + version));
     batch.set_created_ts_ms(1);
-    batch.set_producer_instance_id("producer-0");
+    batch.set_producer_instance_id(producer);
     batch.set_fragment_seq(sequence);
     batch.set_batch_id(batch_id);
     batch.set_protocol_version(3);
@@ -186,6 +187,28 @@ void TestExactVersionTargetOnlyAndAck() {
             "status exposes both behavior versions");
 }
 
+void TestMultipleProducersShareVersionFifo() {
+    SampleStore store(TestConfig());
+    auto first = MakeBatch("producer-0-fragment-1", 64, 1);
+    auto second = MakeBatch(
+        "producer-1-fragment-1", 64, 1, 0, 0, "producer-1");
+
+    Require(Push(store, first).result() == maze::PUSH_RESULT_ACCEPTED,
+            "first producer batch is accepted");
+    Require(Push(store, second).result() == maze::PUSH_RESULT_ACCEPTED,
+            "second producer batch is accepted");
+    auto delivery = Get(store, 128, 20, 100, 0);
+    Require(delivery.result() == maze::GET_BATCH_RESULT_LEASED,
+            "batches from both producers are leased together");
+    Require(delivery.batches_size() == 2 &&
+                delivery.batches(0).producer_instance_id() == "producer-0" &&
+                delivery.batches(1).producer_instance_id() == "producer-1",
+            "producer identity and insertion order remain distinct");
+    Ack(
+        store, delivery.delivery_id(),
+        maze::ACK_DISPOSITION_SHUTDOWN_UNTRAINED);
+}
+
 void TestTargetOnlyDoesNotReturnPartial() {
     SampleStore store(TestConfig());
     Push(store, MakeBatch("partial", 50, 1, 0));
@@ -262,13 +285,47 @@ void TestRenewAndExpiry() {
             "non-training Ack dispositions remain distinct");
 }
 
+void TestSingleConsumerCapability() {
+    SampleStore store(TestConfig());
+    Push(store, MakeBatch("single-consumer", 12, 1, 0));
+    auto first = Get(store, 12, 10, 100, 0);
+    Require(first.result() == maze::GET_BATCH_RESULT_LEASED,
+            "first consumer leases the batch");
+
+    auto second = Get(
+        store, 12, 10, 100, 0,
+        maze::BATCH_SELECTION_POLICY_TARGET_ONLY, "consumer-1");
+    Require(second.result() == maze::GET_BATCH_RESULT_BUSY,
+            "second consumer is rejected while a lease is active");
+
+    maze::DistributorStatusRsp status;
+    store.GetStatus(maze::DistributorStatusReq{}, &status);
+    Require(
+        status.backend_type() == maze::SAMPLE_BACKEND_TYPE_LOCAL_MEMORY,
+        "status identifies the local-memory backend");
+    Require(status.max_concurrent_consumers() == 1,
+            "local backend declares one consumer");
+    Require(status.active_consumer_count() == 1,
+            "active lease is reported as one consumer");
+    Require(status.consumer_busy_count() == 1,
+            "busy consumer attempts are counted");
+    Require(status.ingress_ready() && status.pool_ready(),
+            "combined local service exposes both readiness states");
+
+    Ack(
+        store, first.delivery_id(),
+        maze::ACK_DISPOSITION_SHUTDOWN_UNTRAINED);
+}
+
 }  // namespace
 
 int main() {
     TestPushIdentityAndValidation();
     TestExactVersionTargetOnlyAndAck();
+    TestMultipleProducersShareVersionFifo();
     TestTargetOnlyDoesNotReturnPartial();
     TestRenewAndExpiry();
+    TestSingleConsumerCapability();
     std::cout << "sample_store_contract: PASS" << std::endl;
     return 0;
 }

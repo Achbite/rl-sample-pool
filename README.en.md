@@ -2,7 +2,7 @@
 
 English | [简体中文](README.md)
 
-C++ sample-pool artifact repository, currently at version `0.5.0`. The generated SampleDistributor binary is used by the AIServer training image and is not started as a separate task container.
+C++ local sample-service artifact repository, currently at version `0.6.0`. For local training, `maze_sample_distributor` combines sample ingress with a single-consumer in-memory lease pool. It is supervised by the Learner image, is not a separate task container, and is not equivalent to Reverb.
 
 ## Build
 
@@ -15,10 +15,10 @@ bash build_artifact.sh
 Output directory:
 
 ```text
-../.workspace/artifacts/rl-sample-pool/0.5.0/<platform>/
+../.workspace/artifacts/rl-sample-pool/0.6.0/<platform>/
 ```
 
-Copy the artifact for the selected platform into `rl-aiserver/sample-distributor/` before building the AIServer image.
+Copy the artifact for the selected platform into `rl-learner/sample-pool/` before building the Learner image.
 
 ## License
 
