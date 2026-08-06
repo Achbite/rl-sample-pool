@@ -1,7 +1,7 @@
 #pragma once
 
 #include "config/config_loader.h"
-#include "maze.pb.h"
+#include "training.pb.h"
 
 #include <chrono>
 #include <condition_variable>
@@ -12,28 +12,42 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 
 class SampleStore {
 public:
     explicit SampleStore(const DistributorConfig& config);
 
-    void Push(const maze::SampleBatch& batch, maze::PushSamplesRsp* response);
-    void GetBatch(const maze::GetBatchReq& request,
-                  maze::GetBatchRsp* response,
+    void Push(const rl::training::v1::SampleBatch& batch,
+              rl::training::v1::PushSamplesRsp* response);
+    void GetBatch(const rl::training::v1::GetBatchReq& request,
+                  rl::training::v1::GetBatchRsp* response,
                   const std::function<bool()>& is_cancelled);
-    void Ack(const maze::AckBatchReq& request, maze::DeliveryRsp* response);
-    void Nack(const maze::NackBatchReq& request, maze::DeliveryRsp* response);
-    void RenewLease(const maze::RenewLeaseReq& request,
-                    maze::DeliveryRsp* response);
-    void GetStatus(const maze::DistributorStatusReq& request,
-                   maze::DistributorStatusRsp* response);
+    void Ack(const rl::training::v1::AckBatchReq& request,
+             rl::training::v1::DeliveryRsp* response);
+    void Nack(const rl::training::v1::NackBatchReq& request,
+              rl::training::v1::DeliveryRsp* response);
+    void RenewLease(const rl::training::v1::RenewLeaseReq& request,
+                    rl::training::v1::DeliveryRsp* response);
+    void GetStatus(const rl::training::v1::DistributorStatusReq& request,
+                   rl::training::v1::DistributorStatusRsp* response);
 
     const std::string& instance_id() const;
 
 private:
+    struct BatchFingerprint {
+        std::string payload_sha256;
+        uint64_t serialized_size = 0;
+
+        bool operator==(const BatchFingerprint& other) const {
+            return payload_sha256 == other.payload_sha256 &&
+                   serialized_size == other.serialized_size;
+        }
+    };
+
     struct StoredBatch {
-        maze::SampleBatch batch;
+        rl::training::v1::SampleBatch batch;
+        BatchFingerprint fingerprint;
+        std::string policy_key;
         int64_t sample_count = 0;
         int64_t estimated_bytes = 0;
     };
@@ -41,22 +55,25 @@ private:
     struct Lease {
         std::string delivery_id;
         std::string consumer_instance_id;
-        int behavior_model_version = -1;
+        std::string policy_key;
+        rl::training::v1::BehaviorPolicyIdentity behavior_policy;
         std::chrono::steady_clock::time_point deadline;
-        int64_t deadline_ts_ms = 0;
+        int64_t deadline_unix_ms = 0;
         std::deque<StoredBatch> batches;
         int64_t sample_count = 0;
         int64_t estimated_bytes = 0;
     };
 
     struct DeliveryRecord {
-        maze::DeliveryResult result = maze::DELIVERY_RESULT_UNSPECIFIED;
-        maze::AckDisposition disposition =
-            maze::ACK_DISPOSITION_UNSPECIFIED;
+        rl::training::v1::DeliveryResult result =
+            rl::training::v1::DELIVERY_RESULT_UNSPECIFIED;
+        rl::training::v1::AckDisposition disposition =
+            rl::training::v1::ACK_DISPOSITION_UNSPECIFIED;
         std::string train_update_id;
     };
 
-    struct VersionCounters {
+    struct PolicyCounters {
+        rl::training::v1::ModelIdentity behavior_model;
         int64_t ready_samples = 0;
         int64_t ready_fragments = 0;
         int64_t leased_samples = 0;
@@ -69,46 +86,77 @@ private:
         int64_t shutdown_untrained_samples = 0;
     };
 
-    static constexpr uint32_t kProtocolVersion = 3;
-
     static int64_t NowMs();
     static std::string CreateInstanceId(const std::string& prefix);
-    static int64_t CountSamples(const maze::SampleBatch& batch);
-    static int64_t EstimateBytes(const maze::SampleBatch& batch);
-    static bool IsSha256(const std::string& value);
+    static int64_t CountSamples(const rl::training::v1::SampleBatch& batch);
+    static int64_t EstimateBytes(const rl::training::v1::SampleBatch& batch);
+    static std::string DeterministicSerialize(
+        const rl::training::v1::SampleBatch& batch,
+        bool clear_payload_digest);
+    static std::string Sha256Hex(const std::string& data);
+    static BatchFingerprint FingerprintBatch(
+        const rl::training::v1::SampleBatch& batch);
+    static bool IsSha256(const rl::common::v1::ContentDigest& digest);
+    static bool IsServiceIdentityValid(
+        const rl::common::v1::ServiceInstanceIdentity& identity);
+    static std::string ServiceKey(
+        const rl::common::v1::ServiceInstanceIdentity& identity);
+    static bool IsModelIdentityValid(
+        const rl::training::v1::ModelIdentity& identity);
+    static bool IsSchemaIdentityValid(
+        const rl::common::v1::SchemaIdentity& identity);
+    static std::string PolicyKey(
+        const rl::training::v1::ModelIdentity& model,
+        const rl::training::v1::TrainingSemanticsIdentity& semantics);
 
-    bool ValidateBatchLocked(const maze::SampleBatch& batch,
+    bool ContractMatchesConfig(
+        const rl::common::v1::ContractIdentity& contract) const;
+    bool ValidateSemantics(
+        const rl::training::v1::TrainingSemanticsIdentity& semantics,
+        std::string* error) const;
+    bool ValidateBatchLocked(const rl::training::v1::SampleBatch& batch,
                              std::string* error) const;
-    bool DeliveryBelongsToInstanceLocked(
-        const std::string& delivery_id) const;
+    bool DeliveryBelongsToInstanceLocked(const std::string& delivery_id) const;
     bool CapacityAllowsLocked(int64_t samples,
                               int64_t fragments,
                               int64_t estimated_bytes) const;
-    maze::PressureState PressureStateLocked() const;
+    rl::training::v1::PressureState PressureStateLocked() const;
 
+    void FillServiceIdentity(
+        rl::common::v1::ServiceInstanceIdentity* identity) const;
+    void FillContractIdentity(
+        rl::common::v1::ContractIdentity* identity) const;
     void ReclaimExpiredLeaseLocked();
     void RequeueLeaseLocked(bool expired);
     void RememberDeliveryLocked(const std::string& delivery_id,
                                 const DeliveryRecord& record);
+    void RememberCompletedBatchLocked(
+        const std::string& batch_id,
+        const BatchFingerprint& fingerprint);
     const DeliveryRecord* DeliveryHistoryLocked(
         const std::string& delivery_id) const;
-    void FillStatusLocked(maze::DistributorStatusRsp* response) const;
-    void FillDeliveryResponseLocked(maze::DeliveryRsp* response) const;
-    int64_t ReadySamplesForVersionLocked(int version) const;
+    void FillStatusLocked(rl::training::v1::DistributorStatusRsp* response) const;
+    void FillDeliveryResponseLocked(
+        rl::training::v1::DeliveryRsp* response) const;
+    int64_t ReadySamplesForPolicyLocked(const std::string& policy_key) const;
 
     DistributorConfig config_;
     std::string instance_id_;
 
     mutable std::mutex mutex_;
     std::condition_variable cv_;
-    std::map<int, std::deque<StoredBatch>> ready_by_version_;
+    std::map<std::string, std::deque<StoredBatch>> ready_by_policy_;
+    std::map<std::string, rl::training::v1::BehaviorPolicyIdentity>
+        behavior_policy_by_key_;
     bool has_lease_ = false;
     Lease lease_;
 
-    std::unordered_set<std::string> accepted_batch_ids_;
+    std::unordered_map<std::string, BatchFingerprint> active_batch_fingerprints_;
+    std::unordered_map<std::string, BatchFingerprint> completed_batch_fingerprints_;
+    std::deque<std::string> completed_batch_order_;
     std::unordered_map<std::string, DeliveryRecord> delivery_history_;
     std::deque<std::string> delivery_history_order_;
-    std::map<int, VersionCounters> version_counters_;
+    std::map<std::string, PolicyCounters> policy_counters_;
     uint64_t next_delivery_seq_ = 1;
 
     int64_t ready_samples_ = 0;
@@ -140,8 +188,8 @@ private:
     int64_t empty_timeout_count_ = 0;
     int64_t consumer_busy_count_ = 0;
 
-    int64_t latest_push_ts_ms_ = 0;
-    int64_t latest_consume_ts_ms_ = 0;
-    int64_t latest_ack_ts_ms_ = 0;
+    int64_t latest_push_unix_ms_ = 0;
+    int64_t latest_consume_unix_ms_ = 0;
+    int64_t latest_ack_unix_ms_ = 0;
     std::string last_error_;
 };

@@ -11,7 +11,7 @@ static const char* kDefaultConfigPath = "configs/distributor_config.yaml";
 
 int main(int argc, char* argv[]) {
     std::cout << "============================================\n";
-    std::cout << "  Maze RL - LocalSampleService\n";
+    std::cout << "  RL Training - Local Sample Pool\n";
     std::cout << "============================================\n\n";
 
     const char* config_path = kDefaultConfigPath;
@@ -20,7 +20,9 @@ int main(int argc, char* argv[]) {
     }
 
     DistributorConfig config;
-    LoadDistributorConfig(config_path, config);
+    if (!LoadDistributorConfig(config_path, config)) {
+        return 2;
+    }
 
     SampleDistributorServiceImpl service(config);
     std::string listen_addr = "0.0.0.0:" + std::to_string(config.listen_port);
@@ -35,12 +37,12 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::cout << "[LocalSampleService] listening on " << listen_addr << std::endl;
-    std::cout << "[LocalSampleService] backend=LOCAL_MEMORY"
+    std::cout << "[SamplePool] listening on " << listen_addr << std::endl;
+    std::cout << "[SamplePool] backend=LOCAL_MEMORY"
               << ", max_concurrent_consumers=1" << std::endl;
-    std::cout << "[LocalSampleService] instance_id="
+    std::cout << "[SamplePool] instance_id="
               << service.instance_id() << std::endl;
-    std::cout << "[LocalSampleService] max_queue_samples="
+    std::cout << "[SamplePool] max_queue_samples="
               << config.max_queue_samples
               << ", max_queue_fragments="
               << config.max_queue_fragments

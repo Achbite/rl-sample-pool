@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Protobuf REQUIRED)
+find_package(OpenSSL REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GRPC REQUIRED grpc++)
 
@@ -22,8 +23,9 @@ endif()
 
 set(PROTO_GEN_DIR ${CONTRACT_CPP_DIR})
 set(PROTO_SOURCES
-    ${PROTO_GEN_DIR}/maze.pb.cc
-    ${PROTO_GEN_DIR}/maze.grpc.pb.cc
+    ${PROTO_GEN_DIR}/common.pb.cc
+    ${PROTO_GEN_DIR}/training.pb.cc
+    ${PROTO_GEN_DIR}/training.grpc.pb.cc
 )
 
 add_executable(${PROJECT_NAME} ${SOURCES} ${PROTO_SOURCES})
@@ -37,6 +39,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
     protobuf::libprotobuf
+    OpenSSL::Crypto
     ${GRPC_LIBRARIES}
     pthread
 )
@@ -47,7 +50,8 @@ if(BUILD_TESTING)
         tests/sample_store_test.cpp
         src/config/config_loader.cpp
         src/store/sample_store.cpp
-        ${PROTO_GEN_DIR}/maze.pb.cc
+        ${PROTO_GEN_DIR}/common.pb.cc
+        ${PROTO_GEN_DIR}/training.pb.cc
     )
     target_include_directories(sample_store_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -56,6 +60,7 @@ if(BUILD_TESTING)
     )
     target_link_libraries(sample_store_test PRIVATE
         protobuf::libprotobuf
+        OpenSSL::Crypto
         pthread
     )
     add_test(NAME sample_store_contract COMMAND sample_store_test)

@@ -3,6 +3,15 @@
 #include <cstdint>
 #include <string>
 
+struct ContractConfig {
+    std::string package_name;
+    std::string package_version;
+    std::string source_digest;
+    std::string artifact_digest;
+    std::string platform;
+    std::string generator_identity;
+};
+
 struct DistributorConfig {
     int listen_port = 9100;
     int64_t max_queue_samples = 262144;
@@ -13,6 +22,7 @@ struct DistributorConfig {
     int default_get_timeout_ms = 1000;
     int default_lease_timeout_ms = 10000;
     int delivery_history_size = 4096;
+    ContractConfig contract;
 };
 
 bool LoadDistributorConfig(const std::string& yaml_path, DistributorConfig& out_config);
