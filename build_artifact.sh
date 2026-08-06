@@ -35,8 +35,9 @@ for path in sorted(root.rglob("*")):
 print(digest.hexdigest())
 PY
 )"
+source_status="$(git -C "${repo_dir}" status --porcelain=v1)"
 source_id="${source_commit}"
-if test -n "$(git -C "${repo_dir}" status --porcelain=v1)"; then
+if test -n "${source_status}"; then
     source_id="${source_commit}-dirty-${source_sha256:0:12}"
 fi
 
@@ -92,6 +93,12 @@ PY
     fi
     echo "sample-pool artifact version already exists with different content: ${output_dir}" >&2
     echo "remove that generated artifact explicitly or increment VERSION" >&2
+    exit 1
+fi
+
+if test -n "${source_status}"; then
+    echo "refusing to create a new sample-pool artifact from a dirty worktree" >&2
+    echo "commit the reviewed source first, then rerun this command" >&2
     exit 1
 fi
 
