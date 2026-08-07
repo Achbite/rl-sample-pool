@@ -135,6 +135,9 @@ bool IsAllowedEntry(const YamlEntry& entry) {
         "queue.default_get_timeout_ms",
         "queue.default_lease_timeout_ms",
         "queue.delivery_history_size",
+        "queue.credit_ttl_ms",
+        "queue.credit_wait_retry_after_ms",
+        "queue.max_demand_ttl_ms",
         "contract.package_name",
         "contract.package_version",
         "contract.source_digest",
@@ -199,6 +202,11 @@ bool LoadDistributorConfig(const std::string& yaml_path,
         required("queue", "default_lease_timeout_ms");
     const std::string* delivery_history =
         required("queue", "delivery_history_size");
+    const std::string* credit_ttl = required("queue", "credit_ttl_ms");
+    const std::string* credit_wait_retry =
+        required("queue", "credit_wait_retry_after_ms");
+    const std::string* max_demand_ttl =
+        required("queue", "max_demand_ttl_ms");
     const std::string* package_name = required("contract", "package_name");
     const std::string* package_version =
         required("contract", "package_version");
@@ -211,7 +219,8 @@ bool LoadDistributorConfig(const std::string& yaml_path,
     if (!listen_port || !max_samples || !max_fragments ||
         !max_fragment_samples || !max_bytes ||
         !max_dedup || !high_watermark || !get_timeout || !lease_timeout ||
-        !delivery_history || !package_name || !package_version ||
+        !delivery_history || !credit_ttl || !credit_wait_retry ||
+        !max_demand_ttl || !package_name || !package_version ||
         !source_digest || !artifact_digest || !platform || !generator) {
         return false;
     }
@@ -224,7 +233,11 @@ bool LoadDistributorConfig(const std::string& yaml_path,
         !ParseDouble(*high_watermark, &parsed.high_watermark_ratio) ||
         !ParseInteger(*get_timeout, &parsed.default_get_timeout_ms) ||
         !ParseInteger(*lease_timeout, &parsed.default_lease_timeout_ms) ||
-        !ParseInteger(*delivery_history, &parsed.delivery_history_size)) {
+        !ParseInteger(*delivery_history, &parsed.delivery_history_size) ||
+        !ParseInteger(*credit_ttl, &parsed.credit_ttl_ms) ||
+        !ParseInteger(*credit_wait_retry,
+                      &parsed.credit_wait_retry_after_ms) ||
+        !ParseInteger(*max_demand_ttl, &parsed.max_demand_ttl_ms)) {
         std::cerr << "[SamplePool] a numeric config value is malformed"
                   << std::endl;
         return false;
@@ -245,8 +258,11 @@ bool LoadDistributorConfig(const std::string& yaml_path,
         parsed.default_get_timeout_ms <= 0 ||
         parsed.default_lease_timeout_ms <= 0 ||
         parsed.delivery_history_size <= 0 ||
+        parsed.credit_ttl_ms <= 0 ||
+        parsed.credit_wait_retry_after_ms <= 0 ||
+        parsed.max_demand_ttl_ms < parsed.credit_ttl_ms ||
         parsed.contract.package_name != "rl-contracts" ||
-        parsed.contract.package_version != "0.9.1" ||
+        parsed.contract.package_version != "0.10.0" ||
         !IsLowerSha256(parsed.contract.source_digest) ||
         !IsLowerSha256(parsed.contract.artifact_digest) ||
         parsed.contract.platform.empty() ||

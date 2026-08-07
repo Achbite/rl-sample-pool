@@ -23,7 +23,7 @@ bool FiniteRepeated(const google::protobuf::RepeatedField<float>& values) {
 }  // namespace
 
 SampleStore::SampleStore(const DistributorConfig& config)
-    : config_(config), instance_id_(CreateInstanceId("sample-pool")) {}
+    : config_(config), instance_id_(CreateInstanceId("sample-distributor")) {}
 
 int64_t SampleStore::NowMs() {
     const auto now = std::chrono::system_clock::now();
@@ -46,7 +46,7 @@ int64_t SampleStore::CountSamples(const rl::training::v1::SampleBatch& batch) {
 }
 
 int64_t SampleStore::EstimateBytes(const rl::training::v1::SampleBatch& batch) {
-    return static_cast<int64_t>(batch.SpaceUsedLong());
+    return static_cast<int64_t>(batch.ByteSizeLong());
 }
 
 std::string SampleStore::DeterministicSerialize(
@@ -303,18 +303,39 @@ bool SampleStore::DeliveryBelongsToInstanceLocked(
 bool SampleStore::CapacityAllowsLocked(int64_t samples,
                                        int64_t fragments,
                                        int64_t estimated_bytes) const {
-    return resident_samples_ + samples <= config_.max_queue_samples &&
-           resident_fragments_ + fragments <= config_.max_queue_fragments &&
-           resident_estimated_bytes_ + estimated_bytes <=
+    return resident_samples_ + reserved_samples_ + samples <=
+               config_.max_queue_samples &&
+           resident_fragments_ + reserved_fragments_ + fragments <=
+               config_.max_queue_fragments &&
+           resident_estimated_bytes_ + reserved_estimated_bytes_ +
+                   estimated_bytes <=
                config_.max_queue_estimated_bytes;
+}
+
+bool SampleStore::DemandWindowAllowsLocked(int64_t samples,
+                                           int64_t fragments,
+                                           int64_t estimated_bytes) const {
+    if (!has_active_demand_) return false;
+    const auto& demand = active_demand_.demand;
+    return resident_samples_ + reserved_samples_ + samples <=
+               demand.max_buffered_samples() &&
+           resident_fragments_ + reserved_fragments_ + fragments <=
+               demand.max_buffered_fragments() &&
+           resident_estimated_bytes_ + reserved_estimated_bytes_ +
+                   estimated_bytes <=
+               demand.max_buffered_estimated_bytes();
 }
 
 rl::training::v1::PressureState SampleStore::PressureStateLocked() const {
     const double sample_ratio =
-        static_cast<double>(resident_samples_) / config_.max_queue_samples;
+        static_cast<double>(resident_samples_ + reserved_samples_) /
+        config_.max_queue_samples;
     const double fragment_ratio =
-        static_cast<double>(resident_fragments_) / config_.max_queue_fragments;
-    const double byte_ratio = static_cast<double>(resident_estimated_bytes_) /
+        static_cast<double>(resident_fragments_ + reserved_fragments_) /
+        config_.max_queue_fragments;
+    const double byte_ratio =
+        static_cast<double>(resident_estimated_bytes_ +
+                            reserved_estimated_bytes_) /
                               config_.max_queue_estimated_bytes;
     const double ratio = std::max({sample_ratio, fragment_ratio, byte_ratio});
     if (ratio >= 1.0) return rl::training::v1::PRESSURE_STATE_FULL;
@@ -326,7 +347,7 @@ rl::training::v1::PressureState SampleStore::PressureStateLocked() const {
 
 void SampleStore::FillServiceIdentity(
     rl::common::v1::ServiceInstanceIdentity* identity) const {
-    identity->set_component("sample-pool");
+    identity->set_component("sample-distributor");
     identity->set_instance_id(instance_id_);
     identity->set_lifecycle_epoch(1);
 }
@@ -530,26 +551,593 @@ void SampleStore::ReclaimExpiredLeaseLocked() {
     }
 }
 
-void SampleStore::Push(const rl::training::v1::SampleBatch& batch,
+std::string SampleStore::DemandImmutableIdentity(
+    const rl::training::v1::SampleDemand& demand) {
+    rl::training::v1::SampleDemand copy(demand);
+    copy.set_expires_at_unix_ms(0);
+    return copy.SerializeAsString();
+}
+
+std::string SampleStore::CreditRequestIdentity(
+    const rl::training::v1::AcquireSampleCreditReq& request) {
+    return request.SerializeAsString();
+}
+
+bool SampleStore::ValidateDemandLocked(
+    const rl::training::v1::SampleDemand& demand,
+    std::string* error) const {
+    const int64_t now = NowMs();
+    std::string semantics_error;
+    if (demand.demand_id().empty() || demand.demand_epoch() == 0 ||
+        !IsServiceIdentityValid(demand.consumer()) ||
+        demand.consumer().component() != "learner" ||
+        !ContractMatchesConfig(demand.contract()) ||
+        !ValidateSemantics(demand.training_semantics(), &semantics_error)) {
+        *error = semantics_error.empty()
+                     ? "demand identity or contract is invalid"
+                     : semantics_error;
+        return false;
+    }
+    const auto& freshness = demand.freshness();
+    const auto& assembly = demand.assembly();
+    if (freshness.model_lineage_id().empty() ||
+        freshness.distribution_schema_id().empty() ||
+        !IsSha256(freshness.policy_spec_digest()) ||
+        freshness.max_sample_age_ms() <= 0 ||
+        freshness.distribution_schema_id() !=
+            demand.training_semantics().policy_distribution_schema_id() ||
+        assembly.mode() !=
+            rl::training::v1::BATCH_ASSEMBLY_MODE_TARGET_BOUNDED ||
+        assembly.target_samples() <= 0 ||
+        assembly.max_samples() < assembly.target_samples() ||
+        assembly.max_samples() - assembly.target_samples() + 1 <
+            config_.max_fragment_samples ||
+        demand.max_buffered_samples() < assembly.max_samples() ||
+        demand.max_buffered_fragments() <= 0 ||
+        demand.max_buffered_estimated_bytes() <= 0 ||
+        demand.expires_at_unix_ms() <= now ||
+        demand.expires_at_unix_ms() - now > config_.max_demand_ttl_ms) {
+        *error = "demand window, freshness or expiry is invalid";
+        return false;
+    }
+    return true;
+}
+
+bool SampleStore::ValidateCreditRequestLocked(
+    const rl::training::v1::AcquireSampleCreditReq& request,
+    std::string* error) const {
+    if (!IsServiceIdentityValid(request.producer()) ||
+        request.producer().component() != kAIServerSampleProducerComponent ||
+        !ContractMatchesConfig(request.contract())) {
+        *error = "credit identity or contract is invalid";
+        return false;
+    }
+    if (request.request_id().empty() || request.batch_id().empty() ||
+        !IsSha256(request.payload_digest()) ||
+        !IsBehaviorPolicyReferenceValid(request.behavior_policy()) ||
+        !ValidateSemantics(request.training_semantics(), error) ||
+        request.behavior_policy().distribution_schema_id() !=
+            request.training_semantics().policy_distribution_schema_id() ||
+        request.sample_count() <= 0 ||
+        request.sample_count() > config_.max_fragment_samples ||
+        request.fragment_count() != 1 || request.estimated_bytes() <= 0 ||
+        request.created_at_unix_ms() <= 0) {
+        if (error->empty()) *error = "credit request is invalid";
+        return false;
+    }
+    return true;
+}
+
+bool SampleStore::CreditMatchesBatchLocked(
+    const CreditRecord& credit,
+    const rl::training::v1::SampleBatch& batch,
+    std::string* error) const {
+    const auto& request = credit.request;
+    if (request.batch_id() != batch.batch_id() ||
+        request.payload_digest().SerializeAsString() !=
+            batch.payload_digest().SerializeAsString() ||
+        request.producer().SerializeAsString() !=
+            batch.producer().SerializeAsString() ||
+        request.contract().SerializeAsString() !=
+            batch.contract().SerializeAsString() ||
+        request.behavior_policy().SerializeAsString() !=
+            batch.behavior_policy().SerializeAsString() ||
+        request.training_semantics().SerializeAsString() !=
+            batch.training_semantics().SerializeAsString() ||
+        request.sample_count() != CountSamples(batch) ||
+        request.fragment_count() != 1 ||
+        request.estimated_bytes() != EstimateBytes(batch) ||
+        request.created_at_unix_ms() != batch.created_at_unix_ms()) {
+        *error = "credit does not authorize this immutable batch";
+        return false;
+    }
+    return true;
+}
+
+void SampleStore::ReleaseReservationLocked(
+    CreditRecord* credit,
+    rl::training::v1::SampleCreditState state) {
+    if (credit->state == rl::training::v1::SAMPLE_CREDIT_STATE_RESERVED) {
+        reserved_samples_ -= credit->request.sample_count();
+        reserved_fragments_ -= credit->request.fragment_count();
+        reserved_estimated_bytes_ -= credit->request.estimated_bytes();
+        terminal_credit_order_.push_back(credit->credit_id);
+    }
+    credit->state = state;
+}
+
+void SampleStore::TrimTerminalCreditHistoryLocked() {
+    while (static_cast<int64_t>(terminal_credit_order_.size()) >
+           config_.max_dedup_entries) {
+        const std::string credit_id = terminal_credit_order_.front();
+        terminal_credit_order_.pop_front();
+        const auto found = credits_by_id_.find(credit_id);
+        if (found == credits_by_id_.end() ||
+            found->second.state ==
+                rl::training::v1::SAMPLE_CREDIT_STATE_RESERVED) {
+            continue;
+        }
+        const auto request = credit_id_by_request_id_.find(
+            found->second.request.request_id());
+        if (request != credit_id_by_request_id_.end() &&
+            request->second == credit_id) {
+            credit_id_by_request_id_.erase(request);
+        }
+        credits_by_id_.erase(found);
+    }
+}
+
+void SampleStore::RevokeCreditsLocked() {
+    for (auto& [id, credit] : credits_by_id_) {
+        (void)id;
+        if (credit.state == rl::training::v1::SAMPLE_CREDIT_STATE_RESERVED) {
+            ReleaseReservationLocked(
+                &credit, rl::training::v1::SAMPLE_CREDIT_STATE_REVOKED);
+            ++credit_revoke_count_;
+        }
+    }
+    TrimTerminalCreditHistoryLocked();
+    cv_.notify_all();
+}
+
+void SampleStore::ExpireFlowControlLocked() {
+    const int64_t now = NowMs();
+    for (auto& [id, credit] : credits_by_id_) {
+        (void)id;
+        if (credit.state == rl::training::v1::SAMPLE_CREDIT_STATE_RESERVED &&
+            credit.expires_at_unix_ms <= now) {
+            ReleaseReservationLocked(
+                &credit, rl::training::v1::SAMPLE_CREDIT_STATE_EXPIRED);
+            ++credit_expire_count_;
+        }
+    }
+    TrimTerminalCreditHistoryLocked();
+    if (has_active_demand_ &&
+        active_demand_.demand.expires_at_unix_ms() <= now) {
+        RevokeCreditsLocked();
+        active_demand_ = DemandState{};
+        has_active_demand_ = false;
+    }
+}
+
+void SampleStore::FillDemandResponseLocked(
+    rl::training::v1::SampleDemandRsp* response) const {
+    FillServiceIdentity(response->mutable_distributor());
+    if (has_active_demand_) {
+        *response->mutable_demand() = active_demand_.demand;
+    }
+    response->set_reserved_samples(reserved_samples_);
+    response->set_reserved_fragments(reserved_fragments_);
+    response->set_reserved_estimated_bytes(reserved_estimated_bytes_);
+}
+
+void SampleStore::FillCreditGrantLocked(
+    const CreditRecord& credit,
+    rl::training::v1::SampleCreditGrant* response) const {
+    response->set_request_id(credit.request.request_id());
+    response->set_credit_id(credit.credit_id);
+    response->set_demand_id(credit.demand_id);
+    response->set_demand_epoch(credit.demand_epoch);
+    response->set_batch_id(credit.request.batch_id());
+    *response->mutable_payload_digest() = credit.request.payload_digest();
+    response->set_granted_samples(credit.request.sample_count());
+    response->set_granted_fragments(credit.request.fragment_count());
+    response->set_granted_estimated_bytes(credit.request.estimated_bytes());
+    response->set_expires_at_unix_ms(credit.expires_at_unix_ms);
+    response->set_pressure_state(PressureStateLocked());
+    FillServiceIdentity(response->mutable_distributor());
+    response->set_state(credit.state);
+}
+
+void SampleStore::UpsertDemand(
+    const rl::training::v1::UpsertSampleDemandReq& request,
+    rl::training::v1::SampleDemandRsp* response) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ReclaimExpiredLeaseLocked();
+    ExpireFlowControlLocked();
+    FillDemandResponseLocked(response);
+    std::string error;
+    if (!ValidateDemandLocked(request.demand(), &error)) {
+        response->set_ret_code(-1);
+        response->set_result(
+            error.find("identity") != std::string::npos ||
+                    error.find("contract") != std::string::npos
+                ? rl::training::v1::SAMPLE_DEMAND_RESULT_REJECTED_IDENTITY
+                : rl::training::v1::SAMPLE_DEMAND_RESULT_REJECTED_INVALID);
+        response->set_message(error);
+        return;
+    }
+
+    const auto& demand = request.demand();
+    const std::string immutable = DemandImmutableIdentity(demand);
+    if (has_active_demand_) {
+        const bool same_owner =
+            active_demand_.demand.demand_id() == demand.demand_id() &&
+            active_demand_.demand.consumer().SerializeAsString() ==
+                demand.consumer().SerializeAsString();
+        if (!same_owner) {
+            response->set_ret_code(-1);
+            response->set_result(
+                rl::training::v1::SAMPLE_DEMAND_RESULT_REJECTED_IDENTITY);
+            response->set_message("another Learner owns the active demand");
+            return;
+        }
+        if (demand.demand_epoch() <
+            active_demand_.demand.demand_epoch()) {
+            response->set_ret_code(-1);
+            response->set_result(
+                rl::training::v1::SAMPLE_DEMAND_RESULT_REJECTED_STALE_EPOCH);
+            response->set_message("demand epoch is stale");
+            return;
+        }
+        if (demand.demand_epoch() ==
+            active_demand_.demand.demand_epoch()) {
+            if (immutable != active_demand_.immutable_identity) {
+                response->set_ret_code(-1);
+                response->set_result(
+                    rl::training::v1::SAMPLE_DEMAND_RESULT_REJECTED_INVALID);
+                response->set_message(
+                    "an existing demand epoch cannot change its window");
+                return;
+            }
+            active_demand_.demand.set_expires_at_unix_ms(
+                demand.expires_at_unix_ms());
+            ++demand_upsert_count_;
+            response->Clear();
+            FillDemandResponseLocked(response);
+            response->set_ret_code(0);
+            response->set_result(
+                rl::training::v1::SAMPLE_DEMAND_RESULT_ALREADY_APPLIED);
+            response->set_message("demand expiry refreshed");
+            draining_ = false;
+            cv_.notify_all();
+            return;
+        }
+        RevokeCreditsLocked();
+    }
+
+    active_demand_.demand = demand;
+    active_demand_.immutable_identity = immutable;
+    active_demand_.created_at_unix_ms = NowMs();
+    has_active_demand_ = true;
+    draining_ = false;
+    ++demand_upsert_count_;
+    response->Clear();
+    FillDemandResponseLocked(response);
+    response->set_ret_code(0);
+    response->set_result(rl::training::v1::SAMPLE_DEMAND_RESULT_APPLIED);
+    response->set_message("demand applied");
+    cv_.notify_all();
+}
+
+void SampleStore::ReleaseDemand(
+    const rl::training::v1::ReleaseSampleDemandReq& request,
+    rl::training::v1::SampleDemandRsp* response) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ExpireFlowControlLocked();
+    FillDemandResponseLocked(response);
+    if (!IsServiceIdentityValid(request.consumer()) ||
+        request.consumer().component() != "learner" ||
+        !ContractMatchesConfig(request.contract()) ||
+        request.demand_id().empty() || request.demand_epoch() == 0) {
+        response->set_ret_code(-1);
+        response->set_result(
+            rl::training::v1::SAMPLE_DEMAND_RESULT_REJECTED_IDENTITY);
+        response->set_message("invalid demand release identity");
+        return;
+    }
+    if (!has_active_demand_) {
+        response->set_ret_code(0);
+        response->set_result(
+            rl::training::v1::SAMPLE_DEMAND_RESULT_NOT_FOUND);
+        response->set_message("demand is not active");
+        return;
+    }
+    if (active_demand_.demand.demand_id() != request.demand_id() ||
+        active_demand_.demand.demand_epoch() != request.demand_epoch() ||
+        active_demand_.demand.consumer().SerializeAsString() !=
+            request.consumer().SerializeAsString()) {
+        response->set_ret_code(-1);
+        response->set_result(
+            rl::training::v1::SAMPLE_DEMAND_RESULT_REJECTED_STALE_EPOCH);
+        response->set_message("demand release does not own the active epoch");
+        return;
+    }
+    RevokeCreditsLocked();
+    active_demand_ = DemandState{};
+    has_active_demand_ = false;
+    draining_ = true;
+    ++demand_release_count_;
+    response->Clear();
+    FillDemandResponseLocked(response);
+    response->set_ret_code(0);
+    response->set_result(rl::training::v1::SAMPLE_DEMAND_RESULT_RELEASED);
+    response->set_message("demand released");
+}
+
+void SampleStore::GetDemandStatus(
+    const rl::training::v1::GetSampleDemandStatusReq& request,
+    rl::training::v1::SampleDemandStatusRsp* response) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ExpireFlowControlLocked();
+    FillServiceIdentity(response->mutable_distributor());
+    response->set_reserved_samples(reserved_samples_);
+    response->set_reserved_fragments(reserved_fragments_);
+    response->set_reserved_estimated_bytes(reserved_estimated_bytes_);
+    if (!IsServiceIdentityValid(request.requester()) ||
+        request.demand_id().empty()) {
+        response->set_ret_code(-1);
+        response->set_result(
+            rl::training::v1::SAMPLE_DEMAND_RESULT_REJECTED_IDENTITY);
+        response->set_message("invalid demand status requester");
+        return;
+    }
+    const bool found = has_active_demand_ &&
+                       active_demand_.demand.demand_id() ==
+                           request.demand_id();
+    response->set_ret_code(0);
+    response->set_active(found);
+    response->set_result(
+        found ? rl::training::v1::SAMPLE_DEMAND_RESULT_APPLIED
+              : rl::training::v1::SAMPLE_DEMAND_RESULT_NOT_FOUND);
+    response->set_message(found ? "demand is active" : "demand not found");
+    if (found) {
+        *response->mutable_demand() = active_demand_.demand;
+        response->set_demand_age_ms(
+            std::max<int64_t>(0, NowMs() -
+                                    active_demand_.created_at_unix_ms));
+    }
+}
+
+void SampleStore::AcquireCredit(
+    const rl::training::v1::AcquireSampleCreditReq& request,
+    rl::training::v1::SampleCreditGrant* response) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ReclaimExpiredLeaseLocked();
+    ExpireFlowControlLocked();
+    ++credit_request_count_;
+    FillServiceIdentity(response->mutable_distributor());
+    response->set_request_id(request.request_id());
+    response->set_batch_id(request.batch_id());
+    response->set_retry_after_ms(config_.credit_wait_retry_after_ms);
+    response->set_pressure_state(PressureStateLocked());
+
+    std::string error;
+    if (!ValidateCreditRequestLocked(request, &error)) {
+        response->set_ret_code(-1);
+        response->set_result(
+            error.find("identity") != std::string::npos ||
+                    error.find("contract") != std::string::npos
+                ? rl::training::v1::SAMPLE_CREDIT_RESULT_REJECTED_IDENTITY
+                : rl::training::v1::SAMPLE_CREDIT_RESULT_REJECTED_INVALID);
+        response->set_message(error);
+        return;
+    }
+
+    const std::string identity = CreditRequestIdentity(request);
+    const auto prior_id = credit_id_by_request_id_.find(request.request_id());
+    if (prior_id != credit_id_by_request_id_.end()) {
+        auto prior = credits_by_id_.find(prior_id->second);
+        if (prior != credits_by_id_.end()) {
+            if (prior->second.request_identity != identity) {
+                response->set_ret_code(-1);
+                response->set_result(
+                    rl::training::v1::SAMPLE_CREDIT_RESULT_REJECTED_INVALID);
+                response->set_message(
+                    "credit request_id conflicts with another payload");
+                return;
+            }
+            if (prior->second.state ==
+                    rl::training::v1::SAMPLE_CREDIT_STATE_RESERVED ||
+                prior->second.state ==
+                    rl::training::v1::SAMPLE_CREDIT_STATE_COMMITTED) {
+                response->Clear();
+                FillCreditGrantLocked(prior->second, response);
+                response->set_ret_code(0);
+                response->set_result(
+                    rl::training::v1::SAMPLE_CREDIT_RESULT_GRANTED);
+                response->set_message("credit request already applied");
+                return;
+            }
+        }
+        credit_id_by_request_id_.erase(prior_id);
+    }
+
+    if (!has_active_demand_) {
+        response->set_ret_code(1);
+        if (draining_) {
+            ++credit_wait_draining_count_;
+            response->set_result(
+                rl::training::v1::SAMPLE_CREDIT_RESULT_WAIT_DRAINING);
+            response->set_message("distributor is draining");
+        } else {
+            ++credit_wait_no_demand_count_;
+            response->set_result(
+                rl::training::v1::SAMPLE_CREDIT_RESULT_WAIT_NO_DEMAND);
+            response->set_message("no active Learner demand");
+        }
+        return;
+    }
+
+    const auto& demand = active_demand_.demand;
+    if (request.training_semantics().SerializeAsString() !=
+        demand.training_semantics().SerializeAsString()) {
+        response->set_ret_code(-1);
+        response->set_result(
+            rl::training::v1::SAMPLE_CREDIT_RESULT_REJECTED_SEMANTICS);
+        response->set_message("sample semantics do not match demand");
+        return;
+    }
+    if (!PolicyMatchesFreshnessLocked(request.behavior_policy(),
+                                      demand.freshness()) ||
+        NowMs() - request.created_at_unix_ms() >
+            demand.freshness().max_sample_age_ms()) {
+        response->set_ret_code(-1);
+        response->set_result(
+            rl::training::v1::SAMPLE_CREDIT_RESULT_REJECTED_FRESHNESS);
+        response->set_message("sample is outside the demand freshness window");
+        return;
+    }
+    if (request.sample_count() > demand.max_buffered_samples() ||
+        request.fragment_count() > demand.max_buffered_fragments() ||
+        request.estimated_bytes() >
+            demand.max_buffered_estimated_bytes()) {
+        response->set_ret_code(-1);
+        response->set_result(
+            rl::training::v1::SAMPLE_CREDIT_RESULT_REJECTED_INVALID);
+        response->set_message("batch exceeds the declared demand window");
+        return;
+    }
+    if (!DemandWindowAllowsLocked(request.sample_count(),
+                                  request.fragment_count(),
+                                  request.estimated_bytes())) {
+        ++credit_wait_inflight_limit_count_;
+        response->set_ret_code(1);
+        response->set_result(
+            rl::training::v1::SAMPLE_CREDIT_RESULT_WAIT_INFLIGHT_LIMIT);
+        response->set_message("Learner demand window is full");
+        return;
+    }
+    if (!CapacityAllowsLocked(request.sample_count(), request.fragment_count(),
+                              request.estimated_bytes())) {
+        ++credit_wait_capacity_count_;
+        response->set_ret_code(1);
+        response->set_result(
+            rl::training::v1::SAMPLE_CREDIT_RESULT_WAIT_CAPACITY);
+        response->set_message("physical sample capacity is full");
+        return;
+    }
+
+    CreditRecord credit;
+    credit.request = request;
+    credit.request_identity = identity;
+    credit.credit_id = instance_id_ + "-credit-" +
+                       std::to_string(next_credit_seq_++);
+    credit.demand_id = demand.demand_id();
+    credit.demand_epoch = demand.demand_epoch();
+    credit.expires_at_unix_ms =
+        std::min(demand.expires_at_unix_ms(),
+                 NowMs() + config_.credit_ttl_ms);
+    credit.state = rl::training::v1::SAMPLE_CREDIT_STATE_RESERVED;
+    reserved_samples_ += request.sample_count();
+    reserved_fragments_ += request.fragment_count();
+    reserved_estimated_bytes_ += request.estimated_bytes();
+    credit_id_by_request_id_[request.request_id()] = credit.credit_id;
+    const std::string credit_id = credit.credit_id;
+    credits_by_id_[credit_id] = std::move(credit);
+    ++credit_grant_count_;
+    response->Clear();
+    FillCreditGrantLocked(credits_by_id_.at(credit_id), response);
+    response->set_ret_code(0);
+    response->set_result(rl::training::v1::SAMPLE_CREDIT_RESULT_GRANTED);
+    response->set_message("credit granted and capacity reserved");
+}
+
+void SampleStore::ReleaseCredit(
+    const rl::training::v1::ReleaseSampleCreditReq& request,
+    rl::training::v1::ReleaseSampleCreditRsp* response) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ExpireFlowControlLocked();
+    FillServiceIdentity(response->mutable_distributor());
+    response->set_credit_id(request.credit_id());
+    if (!IsServiceIdentityValid(request.producer()) ||
+        request.producer().component() != kAIServerSampleProducerComponent ||
+        !ContractMatchesConfig(request.contract()) ||
+        request.credit_id().empty() || request.batch_id().empty() ||
+        !IsSha256(request.payload_digest()) ||
+        request.reason() ==
+            rl::training::v1::SAMPLE_CREDIT_RELEASE_REASON_UNSPECIFIED) {
+        response->set_ret_code(-1);
+        response->set_result(
+            rl::training::v1::SAMPLE_CREDIT_RESULT_REJECTED_IDENTITY);
+        response->set_message("invalid credit release identity");
+        return;
+    }
+    auto found = credits_by_id_.find(request.credit_id());
+    if (found == credits_by_id_.end()) {
+        response->set_ret_code(-1);
+        response->set_result(
+            rl::training::v1::SAMPLE_CREDIT_RESULT_REJECTED_INVALID);
+        response->set_message("credit not found");
+        return;
+    }
+    auto& credit = found->second;
+    if (credit.request.producer().SerializeAsString() !=
+            request.producer().SerializeAsString() ||
+        credit.request.batch_id() != request.batch_id() ||
+        credit.request.payload_digest().SerializeAsString() !=
+            request.payload_digest().SerializeAsString()) {
+        response->set_ret_code(-1);
+        response->set_result(
+            rl::training::v1::SAMPLE_CREDIT_RESULT_REJECTED_IDENTITY);
+        response->set_message("producer does not own this credit");
+        return;
+    }
+    if (credit.state == rl::training::v1::SAMPLE_CREDIT_STATE_RESERVED) {
+        ReleaseReservationLocked(
+            &credit, rl::training::v1::SAMPLE_CREDIT_STATE_RELEASED);
+        ++credit_release_count_;
+    }
+    TrimTerminalCreditHistoryLocked();
+    response->set_ret_code(0);
+    response->set_result(rl::training::v1::SAMPLE_CREDIT_RESULT_GRANTED);
+    response->set_message("credit released");
+    response->set_state(credit.state);
+    cv_.notify_all();
+}
+
+void SampleStore::Push(const rl::training::v1::PushSamplesReq& request,
                        rl::training::v1::PushSamplesRsp* response) {
+    const auto& batch = request.batch();
     const int64_t sample_count = CountSamples(batch);
     const int64_t estimated_bytes = EstimateBytes(batch);
     std::lock_guard<std::mutex> lock(mutex_);
     ReclaimExpiredLeaseLocked();
+    ExpireFlowControlLocked();
     ++push_attempt_count_;
     response->set_batch_id(batch.batch_id());
     FillServiceIdentity(response->mutable_distributor());
 
     std::string error;
-    if (!ValidateBatchLocked(batch, &error)) {
+    auto credit = credits_by_id_.find(request.credit_id());
+    const bool credit_state_valid =
+        credit != credits_by_id_.end() &&
+        (credit->second.state ==
+             rl::training::v1::SAMPLE_CREDIT_STATE_RESERVED ||
+         credit->second.state ==
+             rl::training::v1::SAMPLE_CREDIT_STATE_COMMITTED);
+    if (request.credit_id().empty() || !credit_state_valid ||
+        !CreditMatchesBatchLocked(credit->second, batch, &error) ||
+        !ValidateBatchLocked(batch, &error)) {
         ++rejected_push_attempt_count_;
         rejected_sample_attempts_ += sample_count;
-        last_error_ = error;
+        last_error_ = error.empty() ? "valid sample credit is required" : error;
         response->set_ret_code(-1);
-        response->set_message(error);
+        response->set_message(last_error_);
         response->set_result(
-            error.find("identity") != std::string::npos ||
-                    error.find("contract") != std::string::npos
+            last_error_.find("identity") != std::string::npos ||
+                    last_error_.find("contract") != std::string::npos ||
+                    last_error_.find("credit") != std::string::npos
                 ? rl::training::v1::PUSH_RESULT_REJECTED_IDENTITY
                 : rl::training::v1::PUSH_RESULT_REJECTED_INVALID);
     } else {
@@ -576,7 +1164,12 @@ void SampleStore::Push(const rl::training::v1::SampleBatch& batch,
                 response->set_result(
                     rl::training::v1::PUSH_RESULT_REJECTED_INVALID);
             }
-        } else if (!CapacityAllowsLocked(sample_count, 1, estimated_bytes)) {
+        } else if (resident_samples_ + reserved_samples_ >
+                       config_.max_queue_samples ||
+                   resident_fragments_ + reserved_fragments_ >
+                       config_.max_queue_fragments ||
+                   resident_estimated_bytes_ + reserved_estimated_bytes_ >
+                       config_.max_queue_estimated_bytes) {
             ++rejected_push_attempt_count_;
             rejected_sample_attempts_ += sample_count;
             last_error_ = "queue or dedup capacity exceeded";
@@ -642,6 +1235,24 @@ void SampleStore::Push(const rl::training::v1::SampleBatch& batch,
     response->set_resident_fragments(resident_fragments_);
     response->set_resident_estimated_bytes(resident_estimated_bytes_);
     response->set_pressure_state(PressureStateLocked());
+    if (credit != credits_by_id_.end() &&
+        credit->second.state ==
+            rl::training::v1::SAMPLE_CREDIT_STATE_RESERVED) {
+        if (response->result() == rl::training::v1::PUSH_RESULT_ACCEPTED ||
+            response->result() == rl::training::v1::PUSH_RESULT_DUPLICATE) {
+            ReleaseReservationLocked(
+                &credit->second,
+                rl::training::v1::SAMPLE_CREDIT_STATE_COMMITTED);
+            ++credit_commit_count_;
+        } else if (response->result() !=
+                   rl::training::v1::PUSH_RESULT_REJECTED_CAPACITY) {
+            ReleaseReservationLocked(
+                &credit->second,
+                rl::training::v1::SAMPLE_CREDIT_STATE_REVOKED);
+            ++credit_revoke_count_;
+        }
+    }
+    TrimTerminalCreditHistoryLocked();
     cv_.notify_all();
 }
 
@@ -1183,8 +1794,32 @@ void SampleStore::FillStatusLocked(
         response->set_oldest_ready_sample_age_ms(
             std::max<int64_t>(0, NowMs() - oldest_created_at));
         response->set_minimum_ready_model_version(minimum_version);
-        response->set_maximum_ready_model_version(maximum_version);
+    response->set_maximum_ready_model_version(maximum_version);
     }
+    response->set_active_demand_count(has_active_demand_ ? 1 : 0);
+    if (has_active_demand_) {
+        response->set_active_demand_epoch(
+            active_demand_.demand.demand_epoch());
+        response->set_active_demand_age_ms(std::max<int64_t>(
+            0, NowMs() - active_demand_.created_at_unix_ms));
+    }
+    response->set_reserved_samples(reserved_samples_);
+    response->set_reserved_fragments(reserved_fragments_);
+    response->set_reserved_estimated_bytes(reserved_estimated_bytes_);
+    response->set_credit_request_count(credit_request_count_);
+    response->set_credit_grant_count(credit_grant_count_);
+    response->set_credit_commit_count(credit_commit_count_);
+    response->set_credit_release_count(credit_release_count_);
+    response->set_credit_expire_count(credit_expire_count_);
+    response->set_credit_revoke_count(credit_revoke_count_);
+    response->set_credit_wait_no_demand_count(
+        credit_wait_no_demand_count_);
+    response->set_credit_wait_inflight_limit_count(
+        credit_wait_inflight_limit_count_);
+    response->set_credit_wait_capacity_count(credit_wait_capacity_count_);
+    response->set_credit_wait_draining_count(credit_wait_draining_count_);
+    response->set_demand_upsert_count(demand_upsert_count_);
+    response->set_demand_release_count(demand_release_count_);
 }
 
 void SampleStore::GetStatus(
@@ -1192,6 +1827,7 @@ void SampleStore::GetStatus(
     rl::training::v1::DistributorStatusRsp* response) {
     std::lock_guard<std::mutex> lock(mutex_);
     ReclaimExpiredLeaseLocked();
+    ExpireFlowControlLocked();
     FillStatusLocked(response);
 }
 

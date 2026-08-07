@@ -14,9 +14,9 @@
 namespace {
 
 constexpr char kSourceDigest[] =
-    "861575536f18342fd427661c8f21b7b98994913e1e1c998f87fce5ee1490d438";
+    "fc1bf2e3dfd804431f2528d8da53227e55ca9b58b32fc95327558d91cebb3b97";
 constexpr char kArtifactDigest[] =
-    "b8e8cdabf05b15b830b27edd1555904269202042756ecf0ed8158184e57ce8f6";
+    "d90083d97e377230f50c820d040a5d83ce7435dc88c4f948c222c86ac4a429ae";
 constexpr char kGeneratorIdentity[] =
     "0eb73fc2cb675bdb34bf3db9c99dae62a82f93a5e3a72db84dcf3936464729c8";
 
@@ -75,7 +75,7 @@ void FillService(rl::common::v1::ServiceInstanceIdentity* service,
 
 void FillContract(rl::common::v1::ContractIdentity* contract) {
     contract->set_package_name("rl-contracts");
-    contract->set_package_version("0.9.1");
+    contract->set_package_version("0.10.0");
     SetDigest(contract->mutable_source_digest(), kSourceDigest);
     SetDigest(contract->mutable_artifact_digest(), kArtifactDigest);
     contract->set_platform("linux/arm64");
@@ -121,7 +121,7 @@ DistributorConfig TestConfig() {
     config.default_lease_timeout_ms = 100;
     config.max_fragment_samples = 128;
     config.contract.package_name = "rl-contracts";
-    config.contract.package_version = "0.9.1";
+    config.contract.package_version = "0.10.0";
     config.contract.source_digest = kSourceDigest;
     config.contract.artifact_digest = kArtifactDigest;
     config.contract.platform = "linux/arm64";
@@ -180,11 +180,146 @@ rl::training::v1::SampleBatch MakeBatch(
     return batch;
 }
 
+rl::training::v1::UpsertSampleDemandReq MakeDemand(
+    uint64_t epoch = 1,
+    int64_t max_buffered_samples = 10000,
+    int64_t max_buffered_fragments = 100,
+    uint64_t reference_model_version = 1000,
+    uint32_t max_version_lag = 1000,
+    int64_t ttl_ms = 10000) {
+    rl::training::v1::UpsertSampleDemandReq request;
+    auto* demand = request.mutable_demand();
+    demand->set_demand_id("test-demand");
+    demand->set_demand_epoch(epoch);
+    FillService(demand->mutable_consumer(), "learner", "consumer-0");
+    FillContract(demand->mutable_contract());
+    *demand->mutable_training_semantics() = MakeSemantics();
+    demand->mutable_freshness()->set_model_lineage_id(
+        "maze-fixed-map-seed-0");
+    demand->mutable_freshness()->set_reference_model_version(
+        reference_model_version);
+    demand->mutable_freshness()->set_max_version_lag(max_version_lag);
+    demand->mutable_freshness()->set_max_sample_age_ms(60000);
+    demand->mutable_freshness()->set_distribution_schema_id(
+        "categorical.logits.v1");
+    SetDigest(demand->mutable_freshness()->mutable_policy_spec_digest(),
+              std::string(64, '5'));
+    demand->mutable_assembly()->set_target_samples(1);
+    demand->mutable_assembly()->set_max_samples(128);
+    demand->mutable_assembly()->set_mode(
+        rl::training::v1::BATCH_ASSEMBLY_MODE_TARGET_BOUNDED);
+    demand->set_max_buffered_samples(max_buffered_samples);
+    demand->set_max_buffered_fragments(max_buffered_fragments);
+    demand->set_max_buffered_estimated_bytes(64 * 1024 * 1024);
+    demand->set_expires_at_unix_ms(NowMs() + ttl_ms);
+    return request;
+}
+
+rl::training::v1::AcquireSampleCreditReq MakeCreditRequest(
+    const rl::training::v1::SampleBatch& batch,
+    const std::string& request_id = "") {
+    rl::training::v1::AcquireSampleCreditReq request;
+    request.set_request_id(request_id.empty()
+                               ? batch.batch_id() + "-credit-request"
+                               : request_id);
+    *request.mutable_producer() = batch.producer();
+    *request.mutable_contract() = batch.contract();
+    request.set_batch_id(batch.batch_id());
+    *request.mutable_payload_digest() = batch.payload_digest();
+    *request.mutable_behavior_policy() = batch.behavior_policy();
+    *request.mutable_training_semantics() = batch.training_semantics();
+    request.set_sample_count(batch.samples_size());
+    request.set_fragment_count(1);
+    request.set_estimated_bytes(batch.ByteSizeLong());
+    request.set_created_at_unix_ms(batch.created_at_unix_ms());
+    return request;
+}
+
+rl::training::v1::SampleDemandRsp Upsert(
+    SampleStore& store,
+    const rl::training::v1::UpsertSampleDemandReq& request) {
+    rl::training::v1::SampleDemandRsp response;
+    store.UpsertDemand(request, &response);
+    return response;
+}
+
+rl::training::v1::SampleCreditGrant Acquire(
+    SampleStore& store,
+    const rl::training::v1::AcquireSampleCreditReq& request) {
+    rl::training::v1::SampleCreditGrant response;
+    store.AcquireCredit(request, &response);
+    return response;
+}
+
 rl::training::v1::PushSamplesRsp Push(
     SampleStore& store,
     const rl::training::v1::SampleBatch& batch) {
+    rl::training::v1::UpsertSampleDemandReq demand_request;
+    auto* demand = demand_request.mutable_demand();
+    demand->set_demand_id("test-demand");
+    demand->set_demand_epoch(1);
+    FillService(demand->mutable_consumer(), "learner", "consumer-0");
+    FillContract(demand->mutable_contract());
+    *demand->mutable_training_semantics() = MakeSemantics();
+    demand->mutable_freshness()->set_model_lineage_id(
+        "maze-fixed-map-seed-0");
+    demand->mutable_freshness()->set_reference_model_version(1000);
+    demand->mutable_freshness()->set_max_version_lag(1000);
+    demand->mutable_freshness()->set_max_sample_age_ms(60000);
+    demand->mutable_freshness()->set_distribution_schema_id(
+        "categorical.logits.v1");
+    SetDigest(demand->mutable_freshness()->mutable_policy_spec_digest(),
+              std::string(64, '5'));
+    demand->mutable_assembly()->set_target_samples(1);
+    demand->mutable_assembly()->set_max_samples(128);
+    demand->mutable_assembly()->set_mode(
+        rl::training::v1::BATCH_ASSEMBLY_MODE_TARGET_BOUNDED);
+    demand->set_max_buffered_samples(10000);
+    demand->set_max_buffered_fragments(100);
+    demand->set_max_buffered_estimated_bytes(64 * 1024 * 1024);
+    demand->set_expires_at_unix_ms(NowMs() + 10000);
+    rl::training::v1::SampleDemandRsp demand_response;
+    store.UpsertDemand(demand_request, &demand_response);
+
+    rl::training::v1::AcquireSampleCreditReq credit_request;
+    credit_request.set_request_id(batch.batch_id() + "-credit-request");
+    *credit_request.mutable_producer() = batch.producer();
+    *credit_request.mutable_contract() = batch.contract();
+    credit_request.set_batch_id(batch.batch_id());
+    *credit_request.mutable_payload_digest() = batch.payload_digest();
+    *credit_request.mutable_behavior_policy() = batch.behavior_policy();
+    *credit_request.mutable_training_semantics() = batch.training_semantics();
+    credit_request.set_sample_count(batch.samples_size());
+    credit_request.set_fragment_count(1);
+    credit_request.set_estimated_bytes(batch.ByteSizeLong());
+    credit_request.set_created_at_unix_ms(batch.created_at_unix_ms());
+    rl::training::v1::SampleCreditGrant credit;
+    store.AcquireCredit(credit_request, &credit);
     rl::training::v1::PushSamplesRsp response;
-    store.Push(batch, &response);
+    if (credit.result() != rl::training::v1::SAMPLE_CREDIT_RESULT_GRANTED) {
+        response.set_ret_code(-1);
+        response.set_message(credit.message());
+        response.set_batch_id(batch.batch_id());
+        if (credit.result() ==
+                rl::training::v1::SAMPLE_CREDIT_RESULT_WAIT_CAPACITY ||
+            credit.result() ==
+                rl::training::v1::SAMPLE_CREDIT_RESULT_WAIT_INFLIGHT_LIMIT) {
+            response.set_result(
+                rl::training::v1::PUSH_RESULT_REJECTED_CAPACITY);
+        } else if (credit.result() ==
+                   rl::training::v1::SAMPLE_CREDIT_RESULT_REJECTED_IDENTITY) {
+            response.set_result(
+                rl::training::v1::PUSH_RESULT_REJECTED_IDENTITY);
+        } else {
+            response.set_result(
+                rl::training::v1::PUSH_RESULT_REJECTED_INVALID);
+        }
+        return response;
+    }
+    rl::training::v1::PushSamplesReq request;
+    request.set_credit_id(credit.credit_id());
+    *request.mutable_batch() = batch;
+    store.Push(request, &response);
     return response;
 }
 
@@ -245,9 +380,10 @@ void TestPushIdentityAndValidation() {
     config.max_queue_samples = 2;
     SampleStore store(config);
     auto first = MakeBatch("batch-1", 2, 1);
-    Require(Push(store, first).result() ==
+    const auto first_response = Push(store, first);
+    Require(first_response.result() ==
                 rl::training::v1::PUSH_RESULT_ACCEPTED,
-            "first batch must be accepted");
+            "first batch must be accepted: " + first_response.message());
     Require(Push(store, first).result() ==
                 rl::training::v1::PUSH_RESULT_DUPLICATE,
             "same batch_id and payload must be idempotent");
@@ -261,24 +397,25 @@ void TestPushIdentityAndValidation() {
                 rl::training::v1::PUSH_RESULT_REJECTED_CAPACITY,
             "capacity rejects another unique batch");
 
+    SampleStore validation_store(TestConfig());
     auto invalid_digest = first;
     invalid_digest.set_batch_id("invalid-digest");
     invalid_digest.mutable_payload_digest()->set_hex(std::string(64, '0'));
-    Require(Push(store, invalid_digest).result() ==
+    Require(Push(validation_store, invalid_digest).result() ==
                 rl::training::v1::PUSH_RESULT_REJECTED_INVALID,
             "mismatched payload digest is rejected");
 
     auto wrong_contract = MakeBatch("wrong-contract", 1, 3);
     wrong_contract.mutable_contract()->set_package_version("0.7.0");
     RefreshPayloadDigest(&wrong_contract);
-    Require(Push(store, wrong_contract).result() ==
+    Require(Push(validation_store, wrong_contract).result() ==
                 rl::training::v1::PUSH_RESULT_REJECTED_IDENTITY,
             "wrong contract identity fails closed");
 
     auto wrong_producer = MakeBatch("wrong-producer", 1, 4);
     wrong_producer.mutable_producer()->set_component("rl-aiserver");
     RefreshPayloadDigest(&wrong_producer);
-    Require(Push(store, wrong_producer).result() ==
+    Require(Push(validation_store, wrong_producer).result() ==
                 rl::training::v1::PUSH_RESULT_REJECTED_IDENTITY,
             "non-canonical producer component fails closed");
 
@@ -288,8 +425,12 @@ void TestPushIdentityAndValidation() {
             "accepted count excludes retries and rejects");
     Require(status.duplicate_push_attempt_count() == 1,
             "duplicate attempt count");
-    Require(status.rejected_push_attempt_count() == 5,
-            "rejected attempt count");
+    Require(status.rejected_push_attempt_count() == 0,
+            "credit rejections do not masquerade as Push rejections");
+    Require(status.credit_grant_count() == 1 &&
+                status.credit_commit_count() == 1 &&
+                status.credit_wait_capacity_count() == 1,
+            "credit reservation and capacity accounting are explicit");
 }
 
 void TestTerminalAndBootstrapContract() {
@@ -330,9 +471,11 @@ void TestBoundedCompletedDedupHistory() {
     DistributorConfig config = TestConfig();
     config.max_dedup_entries = 2;
     SampleStore store(config);
+    const int64_t created_at = NowMs();
     for (int sequence = 1; sequence <= 3; ++sequence) {
         const std::string id = "completed-" + std::to_string(sequence);
-        Require(Push(store, MakeBatch(id, 1, sequence, 0, sequence - 1))
+        Require(Push(store, MakeBatch(id, 1, sequence, 0, sequence - 1,
+                                      "producer-0", created_at))
                     .result() == rl::training::v1::PUSH_RESULT_ACCEPTED,
                 "batch accepted");
         const auto delivery = Get(store, 1, 10, 100, 0);
@@ -342,10 +485,12 @@ void TestBoundedCompletedDedupHistory() {
                     .result() == rl::training::v1::DELIVERY_RESULT_APPLIED,
                 "completed batch acknowledged");
     }
-    Require(Push(store, MakeBatch("completed-3", 1, 3, 0, 2)).result() ==
+    Require(Push(store, MakeBatch("completed-3", 1, 3, 0, 2,
+                                  "producer-0", created_at)).result() ==
                 rl::training::v1::PUSH_RESULT_DUPLICATE,
             "recent completed retry remains idempotent");
-    Require(Push(store, MakeBatch("completed-1", 1, 1, 0, 0)).result() ==
+    Require(Push(store, MakeBatch("completed-1", 1, 1, 0, 0,
+                                  "producer-0", created_at)).result() ==
                 rl::training::v1::PUSH_RESULT_ACCEPTED,
             "bounded completed history eventually evicts old identities");
 }
@@ -499,11 +644,138 @@ void TestRenewExpiryAndSingleConsumer() {
                 status.invalid_sample_count() == 12 &&
                 status.consumer_busy_count() == 1,
             "lease and disposition accounting closes exactly");
-    Require(status.contract().package_version() == "0.9.1" &&
-                status.distributor().component() == "sample-pool" &&
+    Require(status.contract().package_version() == "0.10.0" &&
+                status.distributor().component() == "sample-distributor" &&
                 status.ready() && status.ingress_ready() &&
                 status.pool_ready(),
             "status exposes exact contract and service identity");
+}
+
+void TestDemandCreditFlowControl() {
+    DistributorConfig config = TestConfig();
+    config.max_queue_samples = 256;
+    config.credit_ttl_ms = 10;
+    SampleStore store(config);
+
+    auto batch_a = MakeBatch("credit-a", 128, 1, 2);
+    auto request_a = MakeCreditRequest(batch_a, "request-a");
+    Require(Acquire(store, request_a).result() ==
+                rl::training::v1::SAMPLE_CREDIT_RESULT_WAIT_NO_DEMAND,
+            "producer waits when no Learner demand exists");
+
+    auto demand = MakeDemand(1, 128, 1, 2, 1);
+    Require(Upsert(store, demand).result() ==
+                rl::training::v1::SAMPLE_DEMAND_RESULT_APPLIED,
+            "Learner demand is applied");
+    const auto credit_a = Acquire(store, request_a);
+    Require(credit_a.result() ==
+                rl::training::v1::SAMPLE_CREDIT_RESULT_GRANTED &&
+                credit_a.state() ==
+                    rl::training::v1::SAMPLE_CREDIT_STATE_RESERVED,
+            "credit reserves the declared demand window");
+
+    auto batch_b = MakeBatch("credit-b", 1, 2, 2, 128);
+    auto request_b = MakeCreditRequest(batch_b, "request-b");
+    Require(Acquire(store, request_b).result() ==
+                rl::training::v1::SAMPLE_CREDIT_RESULT_WAIT_INFLIGHT_LIMIT,
+            "a full demand window is a retryable wait");
+
+    rl::training::v1::ReleaseSampleCreditReq release;
+    *release.mutable_producer() = batch_a.producer();
+    *release.mutable_contract() = batch_a.contract();
+    release.set_credit_id(credit_a.credit_id());
+    release.set_batch_id(batch_a.batch_id());
+    *release.mutable_payload_digest() = batch_a.payload_digest();
+    release.set_reason(
+        rl::training::v1::SAMPLE_CREDIT_RELEASE_REASON_PRODUCER_ABORT);
+    rl::training::v1::ReleaseSampleCreditRsp release_response;
+    store.ReleaseCredit(release, &release_response);
+    Require(release_response.state() ==
+                rl::training::v1::SAMPLE_CREDIT_STATE_RELEASED &&
+                Acquire(store, request_b).result() ==
+                    rl::training::v1::SAMPLE_CREDIT_RESULT_GRANTED,
+            "released reservation immediately returns capacity");
+
+    auto epoch_two = MakeDemand(2, 256, 2, 2, 1);
+    Require(Upsert(store, epoch_two).result() ==
+                rl::training::v1::SAMPLE_DEMAND_RESULT_APPLIED,
+            "a newer demand epoch replaces the old window");
+    rl::training::v1::DistributorStatusRsp status;
+    store.GetStatus({}, &status);
+    Require(status.reserved_samples() == 0 &&
+                status.reserved_fragments() == 0 &&
+                status.credit_revoke_count() >= 1,
+            "epoch replacement revokes every outstanding reservation");
+
+    auto immutable_conflict = epoch_two;
+    immutable_conflict.mutable_demand()->set_max_buffered_samples(512);
+    Require(Upsert(store, immutable_conflict).result() ==
+                rl::training::v1::SAMPLE_DEMAND_RESULT_REJECTED_INVALID,
+            "an epoch cannot mutate its immutable demand window");
+
+    auto batch_c = MakeBatch("credit-c", 1, 3, 2, 129);
+    auto request_c = MakeCreditRequest(batch_c, "request-c");
+    const auto credit_c = Acquire(store, request_c);
+    Require(credit_c.result() ==
+                rl::training::v1::SAMPLE_CREDIT_RESULT_GRANTED,
+            "credit is granted under the replacement epoch");
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    const auto reacquired = Acquire(store, request_c);
+    Require(reacquired.result() ==
+                rl::training::v1::SAMPLE_CREDIT_RESULT_GRANTED &&
+                reacquired.credit_id() != credit_c.credit_id(),
+            "an expired reservation can be reacquired idempotently");
+
+    auto conflicting_request = request_c;
+    conflicting_request.set_batch_id("another-batch");
+    Require(Acquire(store, conflicting_request).result() ==
+                rl::training::v1::SAMPLE_CREDIT_RESULT_REJECTED_INVALID,
+            "a request_id cannot authorize another immutable batch");
+
+    auto stale = MakeBatch("stale-credit", 1, 4, 0, 130);
+    Require(Acquire(store, MakeCreditRequest(stale)).result() ==
+                rl::training::v1::SAMPLE_CREDIT_RESULT_REJECTED_FRESHNESS,
+            "policy freshness rejects stale producer samples");
+
+    auto old_contract = MakeCreditRequest(batch_c, "old-contract");
+    old_contract.mutable_contract()->set_package_version("0.9.1");
+    Require(Acquire(store, old_contract).result() ==
+                rl::training::v1::SAMPLE_CREDIT_RESULT_REJECTED_IDENTITY,
+            "the previous contract version fails closed");
+
+    rl::training::v1::ReleaseSampleDemandReq release_demand;
+    *release_demand.mutable_consumer() = epoch_two.demand().consumer();
+    *release_demand.mutable_contract() = epoch_two.demand().contract();
+    release_demand.set_demand_id(epoch_two.demand().demand_id());
+    release_demand.set_demand_epoch(epoch_two.demand().demand_epoch());
+    rl::training::v1::SampleDemandRsp demand_release_response;
+    store.ReleaseDemand(release_demand, &demand_release_response);
+    Require(demand_release_response.result() ==
+                rl::training::v1::SAMPLE_DEMAND_RESULT_RELEASED &&
+                demand_release_response.reserved_samples() == 0 &&
+                demand_release_response.reserved_fragments() == 0 &&
+                Acquire(store, MakeCreditRequest(
+                                   MakeBatch("draining", 1, 5, 2, 131)))
+                        .result() ==
+                    rl::training::v1::SAMPLE_CREDIT_RESULT_WAIT_DRAINING,
+            "release drains the demand and leaves no reservation");
+}
+
+void TestPhysicalCapacityWaitIsDistinct() {
+    DistributorConfig config = TestConfig();
+    config.max_queue_samples = 128;
+    SampleStore store(config);
+    Require(Upsert(store, MakeDemand(1, 1024, 10)).result() ==
+                rl::training::v1::SAMPLE_DEMAND_RESULT_APPLIED,
+            "wide demand is applied");
+    auto first = MakeBatch("physical-a", 100, 1);
+    Require(Acquire(store, MakeCreditRequest(first)).result() ==
+                rl::training::v1::SAMPLE_CREDIT_RESULT_GRANTED,
+            "first physical reservation is granted");
+    auto second = MakeBatch("physical-b", 64, 2, 0, 100);
+    Require(Acquire(store, MakeCreditRequest(second)).result() ==
+                rl::training::v1::SAMPLE_CREDIT_RESULT_WAIT_CAPACITY,
+            "physical capacity wait is distinct from demand-window wait");
 }
 
 }  // namespace
@@ -516,6 +788,8 @@ int main() {
     TestFreshnessRejectsOldButRetainsFuture();
     TestMultipleProducersAndDrain();
     TestRenewExpiryAndSingleConsumer();
+    TestDemandCreditFlowControl();
+    TestPhysicalCapacityWaitIsDistinct();
     std::cout << "sample_store_contract: PASS" << std::endl;
     return 0;
 }

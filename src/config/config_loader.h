@@ -23,6 +23,9 @@ struct DistributorConfig {
     int default_get_timeout_ms = 1000;
     int default_lease_timeout_ms = 10000;
     int delivery_history_size = 4096;
+    int credit_ttl_ms = 10000;
+    int credit_wait_retry_after_ms = 100;
+    int max_demand_ttl_ms = 60000;
     ContractConfig contract;
 };
 

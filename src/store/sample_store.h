@@ -17,7 +17,20 @@ class SampleStore {
 public:
     explicit SampleStore(const DistributorConfig& config);
 
-    void Push(const rl::training::v1::SampleBatch& batch,
+    void UpsertDemand(const rl::training::v1::UpsertSampleDemandReq& request,
+                      rl::training::v1::SampleDemandRsp* response);
+    void ReleaseDemand(const rl::training::v1::ReleaseSampleDemandReq& request,
+                       rl::training::v1::SampleDemandRsp* response);
+    void GetDemandStatus(
+        const rl::training::v1::GetSampleDemandStatusReq& request,
+        rl::training::v1::SampleDemandStatusRsp* response);
+    void AcquireCredit(
+        const rl::training::v1::AcquireSampleCreditReq& request,
+        rl::training::v1::SampleCreditGrant* response);
+    void ReleaseCredit(
+        const rl::training::v1::ReleaseSampleCreditReq& request,
+        rl::training::v1::ReleaseSampleCreditRsp* response);
+    void Push(const rl::training::v1::PushSamplesReq& request,
               rl::training::v1::PushSamplesRsp* response);
     void GetBatch(const rl::training::v1::GetBatchReq& request,
                   rl::training::v1::GetBatchRsp* response,
@@ -70,6 +83,23 @@ private:
         std::string train_update_id;
     };
 
+    struct DemandState {
+        rl::training::v1::SampleDemand demand;
+        std::string immutable_identity;
+        int64_t created_at_unix_ms = 0;
+    };
+
+    struct CreditRecord {
+        rl::training::v1::AcquireSampleCreditReq request;
+        std::string request_identity;
+        std::string credit_id;
+        std::string demand_id;
+        uint64_t demand_epoch = 0;
+        int64_t expires_at_unix_ms = 0;
+        rl::training::v1::SampleCreditState state =
+            rl::training::v1::SAMPLE_CREDIT_STATE_UNSPECIFIED;
+    };
+
     struct PolicyCounters {
         rl::training::v1::BehaviorPolicyReference behavior_policy;
         int64_t ready_samples = 0;
@@ -118,7 +148,34 @@ private:
     bool CapacityAllowsLocked(int64_t samples,
                               int64_t fragments,
                               int64_t estimated_bytes) const;
+    bool DemandWindowAllowsLocked(int64_t samples,
+                                  int64_t fragments,
+                                  int64_t estimated_bytes) const;
     rl::training::v1::PressureState PressureStateLocked() const;
+
+    bool ValidateDemandLocked(const rl::training::v1::SampleDemand& demand,
+                              std::string* error) const;
+    bool ValidateCreditRequestLocked(
+        const rl::training::v1::AcquireSampleCreditReq& request,
+        std::string* error) const;
+    bool CreditMatchesBatchLocked(
+        const CreditRecord& credit,
+        const rl::training::v1::SampleBatch& batch,
+        std::string* error) const;
+    static std::string DemandImmutableIdentity(
+        const rl::training::v1::SampleDemand& demand);
+    static std::string CreditRequestIdentity(
+        const rl::training::v1::AcquireSampleCreditReq& request);
+    void ExpireFlowControlLocked();
+    void RevokeCreditsLocked();
+    void ReleaseReservationLocked(CreditRecord* credit,
+                                  rl::training::v1::SampleCreditState state);
+    void TrimTerminalCreditHistoryLocked();
+    void FillDemandResponseLocked(
+        rl::training::v1::SampleDemandRsp* response) const;
+    void FillCreditGrantLocked(
+        const CreditRecord& credit,
+        rl::training::v1::SampleCreditGrant* response) const;
 
     void FillServiceIdentity(
         rl::common::v1::ServiceInstanceIdentity* identity) const;
@@ -169,6 +226,17 @@ private:
     std::deque<std::string> delivery_history_order_;
     std::map<std::string, PolicyCounters> policy_counters_;
     uint64_t next_delivery_seq_ = 1;
+    uint64_t next_credit_seq_ = 1;
+
+    bool has_active_demand_ = false;
+    bool draining_ = false;
+    DemandState active_demand_;
+    std::unordered_map<std::string, CreditRecord> credits_by_id_;
+    std::unordered_map<std::string, std::string> credit_id_by_request_id_;
+    std::deque<std::string> terminal_credit_order_;
+    int64_t reserved_samples_ = 0;
+    int64_t reserved_fragments_ = 0;
+    int64_t reserved_estimated_bytes_ = 0;
 
     int64_t ready_samples_ = 0;
     int64_t ready_fragments_ = 0;
@@ -198,6 +266,18 @@ private:
     int64_t partial_get_count_ = 0;
     int64_t empty_timeout_count_ = 0;
     int64_t consumer_busy_count_ = 0;
+    int64_t credit_request_count_ = 0;
+    int64_t credit_grant_count_ = 0;
+    int64_t credit_commit_count_ = 0;
+    int64_t credit_release_count_ = 0;
+    int64_t credit_expire_count_ = 0;
+    int64_t credit_revoke_count_ = 0;
+    int64_t credit_wait_no_demand_count_ = 0;
+    int64_t credit_wait_inflight_limit_count_ = 0;
+    int64_t credit_wait_capacity_count_ = 0;
+    int64_t credit_wait_draining_count_ = 0;
+    int64_t demand_upsert_count_ = 0;
+    int64_t demand_release_count_ = 0;
 
     int64_t latest_push_unix_ms_ = 0;
     int64_t latest_consume_unix_ms_ = 0;
