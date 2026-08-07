@@ -117,11 +117,11 @@ std::string SampleStore::ServiceKey(
            std::to_string(identity.lifecycle_epoch());
 }
 
-bool SampleStore::IsModelIdentityValid(
-    const rl::training::v1::ModelIdentity& identity) {
+bool SampleStore::IsBehaviorPolicyReferenceValid(
+    const rl::training::v1::BehaviorPolicyReference& identity) {
     return !identity.model_lineage_id().empty() &&
-           IsSha256(identity.artifact_digest()) &&
-           IsSha256(identity.manifest_digest());
+           !identity.distribution_schema_id().empty() &&
+           IsSha256(identity.policy_spec_digest());
 }
 
 bool SampleStore::IsSchemaIdentityValid(
@@ -131,12 +131,12 @@ bool SampleStore::IsSchemaIdentityValid(
 }
 
 std::string SampleStore::PolicyKey(
-    const rl::training::v1::ModelIdentity& model,
+    const rl::training::v1::BehaviorPolicyReference& policy,
     const rl::training::v1::TrainingSemanticsIdentity& semantics) {
-    return model.model_lineage_id() + "\x1f" +
-           std::to_string(model.model_version()) + "\x1f" +
-           model.artifact_digest().hex() + "\x1f" +
-           model.manifest_digest().hex() + "\x1f" +
+    return policy.model_lineage_id() + "\x1f" +
+           std::to_string(policy.model_version()) + "\x1f" +
+           policy.distribution_schema_id() + "\x1f" +
+           policy.policy_spec_digest().hex() + "\x1f" +
            semantics.semantics_digest().hex();
 }
 
@@ -186,10 +186,8 @@ bool SampleStore::ValidateBatchLocked(
         *error = "contract identity does not match the configured artifact";
         return false;
     }
-    if (!IsModelIdentityValid(batch.behavior_policy().model()) ||
-        batch.behavior_policy().distribution_schema_id().empty() ||
-        !IsSha256(batch.behavior_policy().policy_spec_digest())) {
-        *error = "behavior policy identity is invalid";
+    if (!IsBehaviorPolicyReferenceValid(batch.behavior_policy())) {
+        *error = "behavior policy reference is invalid";
         return false;
     }
     if (!ValidateSemantics(batch.training_semantics(), error)) return false;
@@ -214,6 +212,10 @@ bool SampleStore::ValidateBatchLocked(
     }
     if (batch.samples_size() == 0) {
         *error = "empty fragment is invalid";
+        return false;
+    }
+    if (batch.samples_size() > config_.max_fragment_samples) {
+        *error = "fragment exceeds max_fragment_samples";
         return false;
     }
     if (batch.last_action_step() < batch.first_action_step() ||
@@ -380,26 +382,132 @@ void SampleStore::RememberCompletedBatchLocked(
     }
 }
 
-int64_t SampleStore::ReadySamplesForPolicyLocked(
-    const std::string& policy_key) const {
-    const auto found = policy_counters_.find(policy_key);
-    return found == policy_counters_.end() ? 0 : found->second.ready_samples;
+bool SampleStore::PolicyMatchesFreshnessLocked(
+    const rl::training::v1::BehaviorPolicyReference& policy,
+    const rl::training::v1::SampleFreshnessPolicy& freshness) const {
+    if (policy.model_lineage_id() != freshness.model_lineage_id() ||
+        policy.distribution_schema_id() !=
+            freshness.distribution_schema_id() ||
+        policy.policy_spec_digest().SerializeAsString() !=
+            freshness.policy_spec_digest().SerializeAsString() ||
+        policy.model_version() > freshness.reference_model_version()) {
+        return false;
+    }
+    return freshness.reference_model_version() - policy.model_version() <=
+           freshness.max_version_lag();
+}
+
+int64_t SampleStore::ReadySamplesForFreshnessLocked(
+    const rl::training::v1::SampleFreshnessPolicy& freshness,
+    const rl::training::v1::TrainingSemanticsIdentity& semantics) const {
+    int64_t ready = 0;
+    for (const auto& [key, policy] : behavior_policy_by_key_) {
+        const auto semantic = training_semantics_by_key_.find(key);
+        const auto counters = policy_counters_.find(key);
+        if (semantic == training_semantics_by_key_.end() ||
+            counters == policy_counters_.end() ||
+            semantic->second.SerializeAsString() !=
+                semantics.SerializeAsString() ||
+            !PolicyMatchesFreshnessLocked(policy, freshness)) {
+            continue;
+        }
+        ready += counters->second.ready_samples;
+    }
+    return ready;
+}
+
+std::string SampleStore::OldestCompatiblePolicyKeyLocked(
+    const rl::training::v1::SampleFreshnessPolicy& freshness,
+    const rl::training::v1::TrainingSemanticsIdentity& semantics) const {
+    std::string selected;
+    int64_t oldest = 0;
+    for (const auto& [key, queue] : ready_by_policy_) {
+        if (queue.empty()) continue;
+        const auto policy = behavior_policy_by_key_.find(key);
+        const auto semantic = training_semantics_by_key_.find(key);
+        if (policy == behavior_policy_by_key_.end() ||
+            semantic == training_semantics_by_key_.end() ||
+            semantic->second.SerializeAsString() !=
+                semantics.SerializeAsString() ||
+            !PolicyMatchesFreshnessLocked(policy->second, freshness)) {
+            continue;
+        }
+        const int64_t created = queue.front().batch.created_at_unix_ms();
+        if (selected.empty() || created < oldest ||
+            (created == oldest && key < selected)) {
+            selected = key;
+            oldest = created;
+        }
+    }
+    return selected;
+}
+
+void SampleStore::ExpireStaleReadyLocked(
+    const rl::training::v1::SampleFreshnessPolicy& freshness,
+    const rl::training::v1::TrainingSemanticsIdentity& semantics) {
+    const int64_t now = NowMs();
+    for (auto& [key, queue] : ready_by_policy_) {
+        const auto policy = behavior_policy_by_key_.find(key);
+        const auto semantic = training_semantics_by_key_.find(key);
+        if (policy == behavior_policy_by_key_.end() ||
+            semantic == training_semantics_by_key_.end() ||
+            semantic->second.SerializeAsString() !=
+                semantics.SerializeAsString() ||
+            policy->second.model_lineage_id() !=
+                freshness.model_lineage_id() ||
+            policy->second.distribution_schema_id() !=
+                freshness.distribution_schema_id() ||
+            policy->second.policy_spec_digest().SerializeAsString() !=
+                freshness.policy_spec_digest().SerializeAsString() ||
+            policy->second.model_version() >
+                freshness.reference_model_version()) {
+            continue;
+        }
+        const bool version_stale =
+            freshness.reference_model_version() -
+                policy->second.model_version() >
+            freshness.max_version_lag();
+        while (!queue.empty()) {
+            const int64_t age = std::max<int64_t>(
+                0, now - queue.front().batch.created_at_unix_ms());
+            if (!version_stale && age <= freshness.max_sample_age_ms()) break;
+            StoredBatch stored = std::move(queue.front());
+            queue.pop_front();
+            ready_samples_ -= stored.sample_count;
+            --ready_fragments_;
+            ready_estimated_bytes_ -= stored.estimated_bytes;
+            resident_samples_ -= stored.sample_count;
+            --resident_fragments_;
+            resident_estimated_bytes_ -= stored.estimated_bytes;
+            auto& counters = policy_counters_[key];
+            counters.ready_samples -= stored.sample_count;
+            --counters.ready_fragments;
+            counters.stale_samples += stored.sample_count;
+            stale_sample_count_ += stored.sample_count;
+            const auto active =
+                active_batch_fingerprints_.find(stored.batch.batch_id());
+            if (active != active_batch_fingerprints_.end()) {
+                RememberCompletedBatchLocked(stored.batch.batch_id(),
+                                             active->second);
+                active_batch_fingerprints_.erase(active);
+            }
+        }
+    }
 }
 
 void SampleStore::RequeueLeaseLocked(bool expired) {
     if (!has_lease_) return;
-    auto& queue = ready_by_policy_[lease_.policy_key];
     for (auto it = lease_.batches.rbegin(); it != lease_.batches.rend(); ++it) {
-        queue.push_front(std::move(*it));
+        auto& counters = policy_counters_[it->policy_key];
+        counters.ready_samples += it->sample_count;
+        ++counters.ready_fragments;
+        counters.leased_samples -= it->sample_count;
+        --counters.leased_fragments;
+        ready_by_policy_[it->policy_key].push_front(std::move(*it));
     }
     ready_samples_ += lease_.sample_count;
     ready_fragments_ += static_cast<int64_t>(lease_.batches.size());
     ready_estimated_bytes_ += lease_.estimated_bytes;
-    auto& counters = policy_counters_[lease_.policy_key];
-    counters.ready_samples += lease_.sample_count;
-    counters.ready_fragments += static_cast<int64_t>(lease_.batches.size());
-    counters.leased_samples -= lease_.sample_count;
-    counters.leased_fragments -= static_cast<int64_t>(lease_.batches.size());
 
     DeliveryRecord record;
     if (expired) {
@@ -477,12 +585,16 @@ void SampleStore::Push(const rl::training::v1::SampleBatch& batch,
             response->set_result(rl::training::v1::PUSH_RESULT_REJECTED_CAPACITY);
         } else {
             const std::string policy_key =
-                PolicyKey(batch.behavior_policy().model(),
-                          batch.training_semantics());
+                PolicyKey(batch.behavior_policy(), batch.training_semantics());
             const auto known_policy = behavior_policy_by_key_.find(policy_key);
+            const auto known_semantics =
+                training_semantics_by_key_.find(policy_key);
             if (known_policy != behavior_policy_by_key_.end() &&
-                known_policy->second.SerializeAsString() !=
-                    batch.behavior_policy().SerializeAsString()) {
+                (known_policy->second.SerializeAsString() !=
+                     batch.behavior_policy().SerializeAsString() ||
+                 known_semantics == training_semantics_by_key_.end() ||
+                 known_semantics->second.SerializeAsString() !=
+                     batch.training_semantics().SerializeAsString())) {
                 ++rejected_push_attempt_count_;
                 rejected_sample_attempts_ += sample_count;
                 last_error_ = "policy key conflicts with behavior identity";
@@ -492,6 +604,8 @@ void SampleStore::Push(const rl::training::v1::SampleBatch& batch,
                     rl::training::v1::PUSH_RESULT_REJECTED_IDENTITY);
             } else {
                 behavior_policy_by_key_[policy_key] = batch.behavior_policy();
+                training_semantics_by_key_[policy_key] =
+                    batch.training_semantics();
                 StoredBatch stored;
                 stored.batch = batch;
                 stored.fingerprint = fingerprint;
@@ -500,7 +614,7 @@ void SampleStore::Push(const rl::training::v1::SampleBatch& batch,
                 stored.estimated_bytes = estimated_bytes;
                 ready_by_policy_[policy_key].push_back(std::move(stored));
                 auto& counters = policy_counters_[policy_key];
-                counters.behavior_model = batch.behavior_policy().model();
+                counters.behavior_policy = batch.behavior_policy();
                 counters.ready_samples += sample_count;
                 ++counters.ready_fragments;
                 ready_samples_ += sample_count;
@@ -535,30 +649,35 @@ void SampleStore::GetBatch(
     const rl::training::v1::GetBatchReq& request,
     rl::training::v1::GetBatchRsp* response,
     const std::function<bool()>& is_cancelled) {
-    const int target_samples = request.batch_size();
+    const int target_samples = request.assembly().target_samples();
+    const int max_samples = request.assembly().max_samples();
     const int timeout_ms = request.timeout_ms() > 0
                                ? request.timeout_ms()
                                : config_.default_get_timeout_ms;
     const int lease_timeout_ms = request.lease_timeout_ms() > 0
                                      ? request.lease_timeout_ms()
                                      : config_.default_lease_timeout_ms;
-    const auto selection = request.selection_policy();
+    const auto mode = request.assembly().mode();
     const auto start = std::chrono::steady_clock::now();
     const auto wait_deadline = start + std::chrono::milliseconds(timeout_ms);
-    const std::string policy_key =
-        PolicyKey(request.target_model(), request.required_semantics());
 
     std::unique_lock<std::mutex> lock(mutex_);
     ReclaimExpiredLeaseLocked();
     FillServiceIdentity(response->mutable_distributor());
     std::string semantics_error;
     if (!IsServiceIdentityValid(request.consumer()) || target_samples <= 0 ||
-        timeout_ms <= 0 || lease_timeout_ms <= 0 ||
-        !IsModelIdentityValid(request.target_model()) ||
+        max_samples < target_samples || timeout_ms <= 0 ||
+        lease_timeout_ms <= 0 || request.freshness().model_lineage_id().empty() ||
+        request.freshness().distribution_schema_id().empty() ||
+        !IsSha256(request.freshness().policy_spec_digest()) ||
+        request.freshness().max_sample_age_ms() <= 0 ||
         !ValidateSemantics(request.required_semantics(), &semantics_error) ||
-        (selection != rl::training::v1::BATCH_SELECTION_POLICY_TARGET_ONLY &&
-         selection !=
-             rl::training::v1::BATCH_SELECTION_POLICY_DRAIN_AVAILABLE)) {
+        request.freshness().distribution_schema_id() !=
+            request.required_semantics().policy_distribution_schema_id() ||
+        (mode != rl::training::v1::BATCH_ASSEMBLY_MODE_TARGET_BOUNDED &&
+         mode != rl::training::v1::BATCH_ASSEMBLY_MODE_DRAIN_AVAILABLE) ||
+        (mode == rl::training::v1::BATCH_ASSEMBLY_MODE_TARGET_BOUNDED &&
+         max_samples - target_samples + 1 < config_.max_fragment_samples)) {
         response->set_ret_code(-1);
         response->set_result(rl::training::v1::GET_BATCH_RESULT_REJECTED);
         response->set_message("invalid GetBatch request");
@@ -575,14 +694,16 @@ void SampleStore::GetBatch(
         return;
     }
 
-    const auto ready_for_selection = [&]() {
-        const int64_t available = ReadySamplesForPolicyLocked(policy_key);
-        return selection ==
-                       rl::training::v1::BATCH_SELECTION_POLICY_TARGET_ONLY
+    const auto ready_for_assembly = [&]() {
+        ExpireStaleReadyLocked(request.freshness(),
+                               request.required_semantics());
+        const int64_t available = ReadySamplesForFreshnessLocked(
+            request.freshness(), request.required_semantics());
+        return mode == rl::training::v1::BATCH_ASSEMBLY_MODE_TARGET_BOUNDED
                    ? available >= target_samples
                    : available > 0;
     };
-    while (!ready_for_selection() &&
+    while (!ready_for_assembly() &&
            std::chrono::steady_clock::now() < wait_deadline) {
         if (is_cancelled && is_cancelled()) {
             response->set_ret_code(-1);
@@ -606,11 +727,12 @@ void SampleStore::GetBatch(
             return;
         }
     }
-    if (!ready_for_selection()) {
+    if (!ready_for_assembly()) {
         ++empty_timeout_count_;
         response->set_ret_code(1);
         response->set_result(rl::training::v1::GET_BATCH_RESULT_TIMEOUT);
-        response->set_message("matching policy not available before deadline");
+        response->set_message(
+            "compatible fresh samples not available before deadline");
         response->set_queue_size(ready_samples_);
         response->set_wait_ms(
             std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -621,18 +743,22 @@ void SampleStore::GetBatch(
 
     Lease new_lease;
     new_lease.consumer_instance_id = ServiceKey(request.consumer());
-    new_lease.policy_key = policy_key;
-    new_lease.behavior_policy = behavior_policy_by_key_.at(policy_key);
     new_lease.delivery_id =
         instance_id_ + "-delivery-" + std::to_string(next_delivery_seq_++);
     new_lease.deadline = std::chrono::steady_clock::now() +
                          std::chrono::milliseconds(lease_timeout_ms);
     new_lease.deadline_unix_ms = NowMs() + lease_timeout_ms;
 
-    auto& queue = ready_by_policy_[policy_key];
-    while (!queue.empty() &&
-           (new_lease.sample_count < target_samples ||
-            new_lease.batches.empty())) {
+    while (new_lease.sample_count < target_samples ||
+           mode == rl::training::v1::BATCH_ASSEMBLY_MODE_DRAIN_AVAILABLE) {
+        const std::string policy_key = OldestCompatiblePolicyKeyLocked(
+            request.freshness(), request.required_semantics());
+        if (policy_key.empty()) break;
+        auto& queue = ready_by_policy_[policy_key];
+        if (queue.empty()) break;
+        if (new_lease.sample_count + queue.front().sample_count > max_samples) {
+            break;
+        }
         StoredBatch stored = std::move(queue.front());
         queue.pop_front();
         ready_samples_ -= stored.sample_count;
@@ -644,18 +770,60 @@ void SampleStore::GetBatch(
         new_lease.sample_count += stored.sample_count;
         new_lease.estimated_bytes += stored.estimated_bytes;
         new_lease.batches.push_back(std::move(stored));
+        if (mode == rl::training::v1::BATCH_ASSEMBLY_MODE_TARGET_BOUNDED &&
+            new_lease.sample_count >= target_samples) {
+            break;
+        }
     }
-    auto& counters = policy_counters_[policy_key];
-    counters.leased_samples += new_lease.sample_count;
-    counters.leased_fragments +=
-        static_cast<int64_t>(new_lease.batches.size());
+    if (new_lease.batches.empty() ||
+        (mode == rl::training::v1::BATCH_ASSEMBLY_MODE_TARGET_BOUNDED &&
+         new_lease.sample_count < target_samples)) {
+        for (auto it = new_lease.batches.rbegin();
+             it != new_lease.batches.rend(); ++it) {
+            auto& counters = policy_counters_[it->policy_key];
+            counters.ready_samples += it->sample_count;
+            ++counters.ready_fragments;
+            ready_by_policy_[it->policy_key].push_front(std::move(*it));
+        }
+        ready_samples_ += new_lease.sample_count;
+        ready_fragments_ +=
+            static_cast<int64_t>(new_lease.batches.size());
+        ready_estimated_bytes_ += new_lease.estimated_bytes;
+        response->set_ret_code(-1);
+        response->set_result(rl::training::v1::GET_BATCH_RESULT_REJECTED);
+        response->set_message("bounded assembly invariant violated");
+        response->set_queue_size(ready_samples_);
+        return;
+    }
+    for (const auto& stored : new_lease.batches) {
+        auto& counters = policy_counters_[stored.policy_key];
+        counters.leased_samples += stored.sample_count;
+        ++counters.leased_fragments;
+    }
     if (new_lease.sample_count >= target_samples) {
         ++target_hit_count_;
     } else {
         ++partial_get_count_;
     }
+    uint64_t minimum_version = 0;
+    uint64_t maximum_version = 0;
+    int64_t oldest_created_at = 0;
+    int64_t newest_created_at = 0;
+    bool first_batch = true;
     for (const auto& stored : new_lease.batches) {
         *response->add_batches() = stored.batch;
+        const uint64_t version = stored.batch.behavior_policy().model_version();
+        const int64_t created_at = stored.batch.created_at_unix_ms();
+        if (first_batch) {
+            minimum_version = maximum_version = version;
+            oldest_created_at = newest_created_at = created_at;
+            first_batch = false;
+        } else {
+            minimum_version = std::min(minimum_version, version);
+            maximum_version = std::max(maximum_version, version);
+            oldest_created_at = std::min(oldest_created_at, created_at);
+            newest_created_at = std::max(newest_created_at, created_at);
+        }
     }
     response->set_ret_code(0);
     response->set_result(rl::training::v1::GET_BATCH_RESULT_LEASED);
@@ -672,7 +840,10 @@ void SampleStore::GetBatch(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start)
             .count());
-    *response->mutable_behavior_policy() = new_lease.behavior_policy;
+    response->set_minimum_behavior_model_version(minimum_version);
+    response->set_maximum_behavior_model_version(maximum_version);
+    response->set_oldest_sample_created_at_unix_ms(oldest_created_at);
+    response->set_newest_sample_created_at_unix_ms(newest_created_at);
     lease_ = std::move(new_lease);
     has_lease_ = true;
     latest_consume_unix_ms_ = NowMs();
@@ -748,26 +919,40 @@ void SampleStore::Ack(const rl::training::v1::AckBatchReq& request,
 
     const int64_t samples = lease_.sample_count;
     const int64_t fragments = static_cast<int64_t>(lease_.batches.size());
-    auto& counters = policy_counters_[lease_.policy_key];
-    counters.leased_samples -= samples;
-    counters.leased_fragments -= fragments;
-    counters.acked_samples += samples;
-    counters.acked_fragments += fragments;
+    for (const auto& stored : lease_.batches) {
+        auto& counters = policy_counters_[stored.policy_key];
+        counters.leased_samples -= stored.sample_count;
+        --counters.leased_fragments;
+        counters.acked_samples += stored.sample_count;
+        ++counters.acked_fragments;
+        switch (request.disposition()) {
+            case rl::training::v1::ACK_DISPOSITION_TRAINED:
+                counters.trained_samples += stored.sample_count;
+                break;
+            case rl::training::v1::ACK_DISPOSITION_STALE:
+                counters.stale_samples += stored.sample_count;
+                break;
+            case rl::training::v1::ACK_DISPOSITION_INVALID:
+                counters.invalid_samples += stored.sample_count;
+                break;
+            case rl::training::v1::ACK_DISPOSITION_SHUTDOWN_UNTRAINED:
+                counters.shutdown_untrained_samples += stored.sample_count;
+                break;
+            default:
+                break;
+        }
+    }
     switch (request.disposition()) {
         case rl::training::v1::ACK_DISPOSITION_TRAINED:
-            counters.trained_samples += samples;
             trained_sample_count_ += samples;
             break;
         case rl::training::v1::ACK_DISPOSITION_STALE:
-            counters.stale_samples += samples;
             stale_sample_count_ += samples;
             break;
         case rl::training::v1::ACK_DISPOSITION_INVALID:
-            counters.invalid_samples += samples;
             invalid_sample_count_ += samples;
             break;
         case rl::training::v1::ACK_DISPOSITION_SHUTDOWN_UNTRAINED:
-            counters.shutdown_untrained_samples += samples;
             shutdown_untrained_sample_count_ += samples;
             break;
         default:
@@ -945,7 +1130,7 @@ void SampleStore::FillStatusLocked(
     for (const auto& [key, counters] : policy_counters_) {
         (void)key;
         auto* status = response->add_behavior_versions();
-        *status->mutable_behavior_model() = counters.behavior_model;
+        *status->mutable_behavior_policy() = counters.behavior_policy;
         status->set_ready_samples(counters.ready_samples);
         status->set_ready_fragments(counters.ready_fragments);
         status->set_leased_samples(counters.leased_samples);
@@ -972,6 +1157,34 @@ void SampleStore::FillStatusLocked(
     response->set_ingress_ready(true);
     response->set_pool_ready(true);
     response->set_timestamp_unix_ms(NowMs());
+    bool has_ready = false;
+    int64_t oldest_created_at = 0;
+    uint64_t minimum_version = 0;
+    uint64_t maximum_version = 0;
+    for (const auto& [key, queue] : ready_by_policy_) {
+        if (queue.empty()) continue;
+        const auto policy = behavior_policy_by_key_.find(key);
+        if (policy == behavior_policy_by_key_.end()) continue;
+        for (const auto& stored : queue) {
+            const int64_t created_at = stored.batch.created_at_unix_ms();
+            const uint64_t version = policy->second.model_version();
+            if (!has_ready) {
+                oldest_created_at = created_at;
+                minimum_version = maximum_version = version;
+                has_ready = true;
+            } else {
+                oldest_created_at = std::min(oldest_created_at, created_at);
+                minimum_version = std::min(minimum_version, version);
+                maximum_version = std::max(maximum_version, version);
+            }
+        }
+    }
+    if (has_ready) {
+        response->set_oldest_ready_sample_age_ms(
+            std::max<int64_t>(0, NowMs() - oldest_created_at));
+        response->set_minimum_ready_model_version(minimum_version);
+        response->set_maximum_ready_model_version(maximum_version);
+    }
 }
 
 void SampleStore::GetStatus(

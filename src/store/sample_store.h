@@ -55,8 +55,6 @@ private:
     struct Lease {
         std::string delivery_id;
         std::string consumer_instance_id;
-        std::string policy_key;
-        rl::training::v1::BehaviorPolicyIdentity behavior_policy;
         std::chrono::steady_clock::time_point deadline;
         int64_t deadline_unix_ms = 0;
         std::deque<StoredBatch> batches;
@@ -73,7 +71,7 @@ private:
     };
 
     struct PolicyCounters {
-        rl::training::v1::ModelIdentity behavior_model;
+        rl::training::v1::BehaviorPolicyReference behavior_policy;
         int64_t ready_samples = 0;
         int64_t ready_fragments = 0;
         int64_t leased_samples = 0;
@@ -101,12 +99,12 @@ private:
         const rl::common::v1::ServiceInstanceIdentity& identity);
     static std::string ServiceKey(
         const rl::common::v1::ServiceInstanceIdentity& identity);
-    static bool IsModelIdentityValid(
-        const rl::training::v1::ModelIdentity& identity);
+    static bool IsBehaviorPolicyReferenceValid(
+        const rl::training::v1::BehaviorPolicyReference& identity);
     static bool IsSchemaIdentityValid(
         const rl::common::v1::SchemaIdentity& identity);
     static std::string PolicyKey(
-        const rl::training::v1::ModelIdentity& model,
+        const rl::training::v1::BehaviorPolicyReference& policy,
         const rl::training::v1::TrainingSemanticsIdentity& semantics);
 
     bool ContractMatchesConfig(
@@ -138,7 +136,18 @@ private:
     void FillStatusLocked(rl::training::v1::DistributorStatusRsp* response) const;
     void FillDeliveryResponseLocked(
         rl::training::v1::DeliveryRsp* response) const;
-    int64_t ReadySamplesForPolicyLocked(const std::string& policy_key) const;
+    bool PolicyMatchesFreshnessLocked(
+        const rl::training::v1::BehaviorPolicyReference& policy,
+        const rl::training::v1::SampleFreshnessPolicy& freshness) const;
+    int64_t ReadySamplesForFreshnessLocked(
+        const rl::training::v1::SampleFreshnessPolicy& freshness,
+        const rl::training::v1::TrainingSemanticsIdentity& semantics) const;
+    std::string OldestCompatiblePolicyKeyLocked(
+        const rl::training::v1::SampleFreshnessPolicy& freshness,
+        const rl::training::v1::TrainingSemanticsIdentity& semantics) const;
+    void ExpireStaleReadyLocked(
+        const rl::training::v1::SampleFreshnessPolicy& freshness,
+        const rl::training::v1::TrainingSemanticsIdentity& semantics);
 
     DistributorConfig config_;
     std::string instance_id_;
@@ -146,8 +155,10 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::map<std::string, std::deque<StoredBatch>> ready_by_policy_;
-    std::map<std::string, rl::training::v1::BehaviorPolicyIdentity>
+    std::map<std::string, rl::training::v1::BehaviorPolicyReference>
         behavior_policy_by_key_;
+    std::map<std::string, rl::training::v1::TrainingSemanticsIdentity>
+        training_semantics_by_key_;
     bool has_lease_ = false;
     Lease lease_;
 

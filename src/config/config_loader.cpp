@@ -128,6 +128,7 @@ bool IsAllowedEntry(const YamlEntry& entry) {
         "server.listen_port",
         "queue.max_queue_samples",
         "queue.max_queue_fragments",
+        "queue.max_fragment_samples",
         "queue.max_queue_estimated_bytes",
         "queue.max_dedup_entries",
         "queue.high_watermark_ratio",
@@ -185,6 +186,8 @@ bool LoadDistributorConfig(const std::string& yaml_path,
     const std::string* listen_port = required("server", "listen_port");
     const std::string* max_samples = required("queue", "max_queue_samples");
     const std::string* max_fragments = required("queue", "max_queue_fragments");
+    const std::string* max_fragment_samples =
+        required("queue", "max_fragment_samples");
     const std::string* max_bytes =
         required("queue", "max_queue_estimated_bytes");
     const std::string* max_dedup = required("queue", "max_dedup_entries");
@@ -205,7 +208,8 @@ bool LoadDistributorConfig(const std::string& yaml_path,
     const std::string* platform = required("contract", "platform");
     const std::string* generator =
         required("contract", "generator_identity");
-    if (!listen_port || !max_samples || !max_fragments || !max_bytes ||
+    if (!listen_port || !max_samples || !max_fragments ||
+        !max_fragment_samples || !max_bytes ||
         !max_dedup || !high_watermark || !get_timeout || !lease_timeout ||
         !delivery_history || !package_name || !package_version ||
         !source_digest || !artifact_digest || !platform || !generator) {
@@ -214,6 +218,7 @@ bool LoadDistributorConfig(const std::string& yaml_path,
     if (!ParseInteger(*listen_port, &parsed.listen_port) ||
         !ParseInteger(*max_samples, &parsed.max_queue_samples) ||
         !ParseInteger(*max_fragments, &parsed.max_queue_fragments) ||
+        !ParseInteger(*max_fragment_samples, &parsed.max_fragment_samples) ||
         !ParseInteger(*max_bytes, &parsed.max_queue_estimated_bytes) ||
         !ParseInteger(*max_dedup, &parsed.max_dedup_entries) ||
         !ParseDouble(*high_watermark, &parsed.high_watermark_ratio) ||
@@ -232,6 +237,7 @@ bool LoadDistributorConfig(const std::string& yaml_path,
     parsed.contract.generator_identity = *generator;
     if (parsed.listen_port <= 0 || parsed.listen_port > 65535 ||
         parsed.max_queue_samples <= 0 || parsed.max_queue_fragments <= 0 ||
+        parsed.max_fragment_samples <= 0 ||
         parsed.max_queue_estimated_bytes <= 0 ||
         parsed.max_dedup_entries <= 0 ||
         parsed.high_watermark_ratio <= 0.0 ||
@@ -240,7 +246,7 @@ bool LoadDistributorConfig(const std::string& yaml_path,
         parsed.default_lease_timeout_ms <= 0 ||
         parsed.delivery_history_size <= 0 ||
         parsed.contract.package_name != "rl-contracts" ||
-        parsed.contract.package_version != "0.8.0" ||
+        parsed.contract.package_version != "0.9.1" ||
         !IsLowerSha256(parsed.contract.source_digest) ||
         !IsLowerSha256(parsed.contract.artifact_digest) ||
         parsed.contract.platform.empty() ||

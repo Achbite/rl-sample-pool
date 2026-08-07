@@ -16,6 +16,7 @@ struct DistributorConfig {
     int listen_port = 9100;
     int64_t max_queue_samples = 262144;
     int64_t max_queue_fragments = 4096;
+    int max_fragment_samples = 128;
     int64_t max_queue_estimated_bytes = 536870912;
     int64_t max_dedup_entries = 1000000;
     double high_watermark_ratio = 0.8;

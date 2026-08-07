@@ -14,9 +14,9 @@
 namespace {
 
 constexpr char kSourceDigest[] =
-    "157fba14177a0727abf663c442003e2a5f5c1e297f4af97ea22b45d74cdb32b5";
+    "861575536f18342fd427661c8f21b7b98994913e1e1c998f87fce5ee1490d438";
 constexpr char kArtifactDigest[] =
-    "71a0f13363d62b5d076c02b00e5b4b269a3e91253b190432f2e83c43cdcf7d3a";
+    "b8e8cdabf05b15b830b27edd1555904269202042756ecf0ed8158184e57ce8f6";
 constexpr char kGeneratorIdentity[] =
     "0eb73fc2cb675bdb34bf3db9c99dae62a82f93a5e3a72db84dcf3936464729c8";
 
@@ -75,7 +75,7 @@ void FillService(rl::common::v1::ServiceInstanceIdentity* service,
 
 void FillContract(rl::common::v1::ContractIdentity* contract) {
     contract->set_package_name("rl-contracts");
-    contract->set_package_version("0.8.0");
+    contract->set_package_version("0.9.1");
     SetDigest(contract->mutable_source_digest(), kSourceDigest);
     SetDigest(contract->mutable_artifact_digest(), kArtifactDigest);
     contract->set_platform("linux/arm64");
@@ -97,22 +97,17 @@ rl::training::v1::TrainingSemanticsIdentity MakeSemantics() {
     FillSchema(semantics.mutable_observation_schema(),
                "maze.observation.v3", '1');
     FillSchema(semantics.mutable_action_schema(), "maze.action.v1", '2');
-    FillSchema(semantics.mutable_reward_schema(), "maze.reward.v3", '3');
+    FillSchema(semantics.mutable_reward_schema(), "maze.reward.v4", '3');
     semantics.set_policy_distribution_schema_id("categorical.logits.v1");
     semantics.set_model_architecture_id("maze.mlp-17x64x64.v1");
     SetDigest(semantics.mutable_semantics_digest(), std::string(64, '4'));
     return semantics;
 }
 
-rl::training::v1::ModelIdentity MakeModel(uint64_t version) {
-    rl::training::v1::ModelIdentity model;
-    model.set_model_lineage_id("maze-fixed-map-seed-0");
-    model.set_model_version(version);
-    SetDigest(model.mutable_artifact_digest(),
-              std::string(64, static_cast<char>('a' + version)));
-    SetDigest(model.mutable_manifest_digest(),
-              std::string(64, static_cast<char>('c' + version)));
-    return model;
+int64_t NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
 }
 
 DistributorConfig TestConfig() {
@@ -124,8 +119,9 @@ DistributorConfig TestConfig() {
     config.delivery_history_size = 1000;
     config.default_get_timeout_ms = 10;
     config.default_lease_timeout_ms = 100;
+    config.max_fragment_samples = 128;
     config.contract.package_name = "rl-contracts";
-    config.contract.package_version = "0.8.0";
+    config.contract.package_version = "0.9.1";
     config.contract.source_digest = kSourceDigest;
     config.contract.artifact_digest = kArtifactDigest;
     config.contract.platform = "linux/arm64";
@@ -139,7 +135,8 @@ rl::training::v1::SampleBatch MakeBatch(
     uint64_t sequence,
     uint64_t model_version = 0,
     uint64_t first_step = 0,
-    const std::string& producer = "producer-0") {
+    const std::string& producer = "producer-0",
+    int64_t created_at_unix_ms = 0) {
     rl::training::v1::SampleBatch batch;
     batch.set_batch_id(batch_id);
     batch.set_actor_session_id("actor-session-0");
@@ -150,7 +147,9 @@ rl::training::v1::SampleBatch MakeBatch(
     batch.set_trajectory_end(false);
     batch.set_bootstrap_value(0.25f);
     batch.set_bootstrap_valid(true);
-    *batch.mutable_behavior_policy()->mutable_model() = MakeModel(model_version);
+    batch.mutable_behavior_policy()->set_model_lineage_id(
+        "maze-fixed-map-seed-0");
+    batch.mutable_behavior_policy()->set_model_version(model_version);
     batch.mutable_behavior_policy()->set_distribution_schema_id(
         "categorical.logits.v1");
     SetDigest(batch.mutable_behavior_policy()->mutable_policy_spec_digest(),
@@ -158,7 +157,9 @@ rl::training::v1::SampleBatch MakeBatch(
     *batch.mutable_training_semantics() = MakeSemantics();
     FillService(batch.mutable_producer(), "aiserver", producer);
     FillContract(batch.mutable_contract());
-    batch.set_created_at_unix_ms(1);
+    batch.set_created_at_unix_ms(created_at_unix_ms > 0
+                                     ? created_at_unix_ms
+                                     : NowMs());
     batch.set_first_action_step(first_step);
     batch.set_last_action_step(first_step + sample_count - 1);
     for (int index = 0; index < sample_count; ++index) {
@@ -198,16 +199,25 @@ rl::training::v1::GetBatchRsp Get(
     int timeout_ms,
     int lease_timeout_ms,
     uint64_t version,
-    rl::training::v1::BatchSelectionPolicy policy =
-        rl::training::v1::BATCH_SELECTION_POLICY_TARGET_ONLY,
+    rl::training::v1::BatchAssemblyMode mode =
+        rl::training::v1::BATCH_ASSEMBLY_MODE_TARGET_BOUNDED,
     const std::string& consumer = "consumer-0") {
     rl::training::v1::GetBatchReq request;
     FillConsumer(request.mutable_consumer(), consumer);
-    request.set_batch_size(target);
+    request.mutable_assembly()->set_target_samples(target);
+    request.mutable_assembly()->set_max_samples(target + 127);
+    request.mutable_assembly()->set_mode(mode);
     request.set_timeout_ms(timeout_ms);
     request.set_lease_timeout_ms(lease_timeout_ms);
-    *request.mutable_target_model() = MakeModel(version);
-    request.set_selection_policy(policy);
+    request.mutable_freshness()->set_model_lineage_id(
+        "maze-fixed-map-seed-0");
+    request.mutable_freshness()->set_reference_model_version(version);
+    request.mutable_freshness()->set_max_version_lag(1);
+    request.mutable_freshness()->set_max_sample_age_ms(60000);
+    request.mutable_freshness()->set_distribution_schema_id(
+        "categorical.logits.v1");
+    SetDigest(request.mutable_freshness()->mutable_policy_spec_digest(),
+              std::string(64, '5'));
     *request.mutable_required_semantics() = MakeSemantics();
     rl::training::v1::GetBatchRsp response;
     store.GetBatch(request, &response, []() { return false; });
@@ -340,43 +350,72 @@ void TestBoundedCompletedDedupHistory() {
             "bounded completed history eventually evicts old identities");
 }
 
-void TestExactPolicyTargetAndAck() {
+void TestBoundedMultiVersionAssemblyAndAck() {
     SampleStore store(TestConfig());
     Push(store, MakeBatch("v0-a", 60, 1, 0));
-    Push(store, MakeBatch("v1-a", 512, 2, 1));
-    Push(store, MakeBatch("v0-b", 60, 3, 0, 60));
+    Push(store, MakeBatch("v1-a", 128, 2, 1));
+    Push(store, MakeBatch("v1-b", 128, 3, 1, 128));
+    Push(store, MakeBatch("v1-c", 128, 4, 1, 256));
+    Push(store, MakeBatch("v0-b", 76, 5, 0, 60));
 
-    auto v0 = Get(store, 100, 20, 100, 0);
-    Require(v0.result() == rl::training::v1::GET_BATCH_RESULT_LEASED &&
-                v0.actual_batch_size() == 120 && v0.batches_size() == 2,
-            "matching policy leases whole fragments only");
-    Require(v0.behavior_policy().model().model_version() == 0,
-            "response binds the exact behavior policy");
-    Require(Ack(store, v0.delivery_id(),
+    auto mixed = Get(store, 512, 20, 100, 1);
+    Require(mixed.result() == rl::training::v1::GET_BATCH_RESULT_LEASED &&
+                mixed.actual_batch_size() == 520 &&
+                mixed.actual_batch_size() <= 639 &&
+                mixed.batches_size() == 5,
+            "bounded assembly reaches target with whole fragments");
+    Require(mixed.minimum_behavior_model_version() == 0 &&
+                mixed.maximum_behavior_model_version() == 1,
+            "compatible policy versions may share one PPO delivery");
+    Require(Ack(store, mixed.delivery_id(),
                 rl::training::v1::ACK_DISPOSITION_TRAINED, "update-v0")
                 .result() == rl::training::v1::DELIVERY_RESULT_APPLIED,
             "trained Ack applies");
-    Require(Ack(store, v0.delivery_id(),
+    Require(Ack(store, mixed.delivery_id(),
                 rl::training::v1::ACK_DISPOSITION_TRAINED, "update-v0")
                 .result() ==
                 rl::training::v1::DELIVERY_RESULT_ALREADY_APPLIED,
             "Ack retry is idempotent");
-    Require(Ack(store, v0.delivery_id(),
+    Require(Ack(store, mixed.delivery_id(),
                 rl::training::v1::ACK_DISPOSITION_STALE)
                 .result() == rl::training::v1::DELIVERY_RESULT_REJECTED,
             "Ack retry cannot alter disposition");
 
-    auto v1 = Get(store, 512, 20, 100, 1);
-    Require(v1.actual_batch_size() == 512 &&
-                v1.behavior_policy().model().model_version() == 1,
-            "model identity prevents version mixing");
-    Ack(store, v1.delivery_id(), rl::training::v1::ACK_DISPOSITION_TRAINED,
-        "update-v1");
     rl::training::v1::DistributorStatusRsp status;
     store.GetStatus({}, &status);
-    Require(status.trained_sample_count() == 632 &&
+    Require(status.trained_sample_count() == 520 &&
                 status.behavior_versions_size() == 2,
             "status preserves policy-level accounting");
+}
+
+void TestFreshnessRejectsOldButRetainsFuture() {
+    SampleStore store(TestConfig());
+    Push(store, MakeBatch("stale-version", 64, 1, 0, 0, "producer-0",
+                          NowMs()));
+    Push(store, MakeBatch("current-version", 64, 2, 2, 64, "producer-0",
+                          NowMs()));
+    Push(store, MakeBatch("future-version", 64, 3, 3, 128, "producer-0",
+                          NowMs()));
+
+    auto current = Get(store, 64, 20, 100, 2);
+    Require(current.result() == rl::training::v1::GET_BATCH_RESULT_LEASED &&
+                current.minimum_behavior_model_version() == 2 &&
+                current.maximum_behavior_model_version() == 2,
+            "version window expires old samples and excludes future samples");
+    Ack(store, current.delivery_id(),
+        rl::training::v1::ACK_DISPOSITION_TRAINED, "update-current");
+
+    auto future = Get(store, 64, 20, 100, 3);
+    Require(future.result() == rl::training::v1::GET_BATCH_RESULT_LEASED &&
+                future.minimum_behavior_model_version() == 3,
+            "future samples remain available when reference catches up");
+    Ack(store, future.delivery_id(),
+        rl::training::v1::ACK_DISPOSITION_TRAINED, "update-future");
+
+    rl::training::v1::DistributorStatusRsp status;
+    store.GetStatus({}, &status);
+    Require(status.stale_sample_count() == 64,
+            "expired ready samples have an explicit stale disposition");
 }
 
 void TestMultipleProducersAndDrain() {
@@ -398,7 +437,7 @@ void TestMultipleProducersAndDrain() {
             "TARGET_ONLY never leases a partial target");
     auto partial = Get(
         store, 512, 10, 100, 0,
-        rl::training::v1::BATCH_SELECTION_POLICY_DRAIN_AVAILABLE);
+        rl::training::v1::BATCH_ASSEMBLY_MODE_DRAIN_AVAILABLE);
     Require(partial.result() == rl::training::v1::GET_BATCH_RESULT_LEASED &&
                 partial.actual_batch_size() == 50,
             "DRAIN_AVAILABLE explicitly leases a partial batch");
@@ -412,7 +451,7 @@ void TestMultipleProducersAndDrain() {
             "Nack requeues the exact payload");
     auto redelivery = Get(
         store, 512, 10, 100, 0,
-        rl::training::v1::BATCH_SELECTION_POLICY_DRAIN_AVAILABLE);
+        rl::training::v1::BATCH_ASSEMBLY_MODE_DRAIN_AVAILABLE);
     Require(redelivery.batches(0).batch_id() == "partial",
             "redelivery preserves identity");
     Ack(store, redelivery.delivery_id(),
@@ -432,7 +471,7 @@ void TestRenewExpiryAndSingleConsumer() {
     Require(renewal.result() == rl::training::v1::DELIVERY_RESULT_APPLIED,
             "owner renews lease");
     auto busy = Get(store, 12, 10, 100, 0,
-                    rl::training::v1::BATCH_SELECTION_POLICY_TARGET_ONLY,
+                    rl::training::v1::BATCH_ASSEMBLY_MODE_TARGET_BOUNDED,
                     "consumer-1");
     Require(busy.result() == rl::training::v1::GET_BATCH_RESULT_BUSY,
             "single-consumer capability is explicit");
@@ -460,7 +499,7 @@ void TestRenewExpiryAndSingleConsumer() {
                 status.invalid_sample_count() == 12 &&
                 status.consumer_busy_count() == 1,
             "lease and disposition accounting closes exactly");
-    Require(status.contract().package_version() == "0.8.0" &&
+    Require(status.contract().package_version() == "0.9.1" &&
                 status.distributor().component() == "sample-pool" &&
                 status.ready() && status.ingress_ready() &&
                 status.pool_ready(),
@@ -473,7 +512,8 @@ int main() {
     TestPushIdentityAndValidation();
     TestTerminalAndBootstrapContract();
     TestBoundedCompletedDedupHistory();
-    TestExactPolicyTargetAndAck();
+    TestBoundedMultiVersionAssemblyAndAck();
+    TestFreshnessRejectsOldButRetainsFuture();
     TestMultipleProducersAndDrain();
     TestRenewExpiryAndSingleConsumer();
     std::cout << "sample_store_contract: PASS" << std::endl;
