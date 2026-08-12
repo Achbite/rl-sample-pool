@@ -1,5 +1,7 @@
 #include "grpc/sample_distributor_service.h"
 
+#include <chrono>
+
 SampleDistributorServiceImpl::SampleDistributorServiceImpl(
     const DistributorConfig& config)
     : store_(config) {}
@@ -56,8 +58,12 @@ grpc::Status SampleDistributorServiceImpl::GetBatch(
     grpc::ServerContext* context,
     const rl::training::v1::GetBatchReq* request,
     rl::training::v1::GetBatchRsp* response) {
+    const auto rpc_deadline = context->deadline();
     store_.GetBatch(
-        *request, response, [context]() { return context->IsCancelled(); });
+        *request, response, [context, rpc_deadline]() {
+            return context->IsCancelled() ||
+                   std::chrono::system_clock::now() >= rpc_deadline;
+        });
     return grpc::Status::OK;
 }
 

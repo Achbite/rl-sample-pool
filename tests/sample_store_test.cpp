@@ -1,5 +1,7 @@
 #include "store/sample_store.h"
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <google/protobuf/io/coded_stream.h>
@@ -251,6 +253,23 @@ rl::training::v1::SampleCreditGrant Acquire(
     return response;
 }
 
+rl::training::v1::ReleaseSampleCreditRsp ReleaseCredit(
+    SampleStore& store,
+    const rl::training::v1::SampleCreditGrant& credit,
+    const rl::training::v1::SampleBatch& batch) {
+    rl::training::v1::ReleaseSampleCreditReq request;
+    *request.mutable_producer() = batch.producer();
+    *request.mutable_contract() = batch.contract();
+    request.set_credit_id(credit.credit_id());
+    request.set_batch_id(batch.batch_id());
+    *request.mutable_payload_digest() = batch.payload_digest();
+    request.set_reason(
+        rl::training::v1::SAMPLE_CREDIT_RELEASE_REASON_PRODUCER_ABORT);
+    rl::training::v1::ReleaseSampleCreditRsp response;
+    store.ReleaseCredit(request, &response);
+    return response;
+}
+
 rl::training::v1::PushSamplesRsp Push(
     SampleStore& store,
     const rl::training::v1::SampleBatch& batch) {
@@ -328,8 +347,7 @@ void FillConsumer(rl::common::v1::ServiceInstanceIdentity* consumer,
     FillService(consumer, "learner", instance);
 }
 
-rl::training::v1::GetBatchRsp Get(
-    SampleStore& store,
+rl::training::v1::GetBatchReq MakeGetBatchRequest(
     int target,
     int timeout_ms,
     int lease_timeout_ms,
@@ -354,6 +372,20 @@ rl::training::v1::GetBatchRsp Get(
     SetDigest(request.mutable_freshness()->mutable_policy_spec_digest(),
               std::string(64, '5'));
     *request.mutable_required_semantics() = MakeSemantics();
+    return request;
+}
+
+rl::training::v1::GetBatchRsp Get(
+    SampleStore& store,
+    int target,
+    int timeout_ms,
+    int lease_timeout_ms,
+    uint64_t version,
+    rl::training::v1::BatchAssemblyMode mode =
+        rl::training::v1::BATCH_ASSEMBLY_MODE_TARGET_BOUNDED,
+    const std::string& consumer = "consumer-0") {
+    const auto request = MakeGetBatchRequest(
+        target, timeout_ms, lease_timeout_ms, version, mode, consumer);
     rl::training::v1::GetBatchRsp response;
     store.GetBatch(request, &response, []() { return false; });
     return response;
@@ -778,6 +810,337 @@ void TestPhysicalCapacityWaitIsDistinct() {
             "physical capacity wait is distinct from demand-window wait");
 }
 
+void TestCancelledGetCannotCreateHiddenLease() {
+    SampleStore store(TestConfig());
+    const auto batch = MakeBatch("cancel-late-arrival", 1, 1);
+    Require(Upsert(store, MakeDemand()).result() ==
+                rl::training::v1::SAMPLE_DEMAND_RESULT_APPLIED,
+            "cancellation test demand is applied");
+    const auto credit = Acquire(store, MakeCreditRequest(batch));
+    Require(credit.result() ==
+                rl::training::v1::SAMPLE_CREDIT_RESULT_GRANTED,
+            "late-arrival batch owns capacity before GetBatch waits");
+
+    const auto request = MakeGetBatchRequest(1, 1000, 100, 0);
+    rl::training::v1::GetBatchRsp cancelled_response;
+    std::atomic<bool> cancelled{false};
+    std::atomic<int> cancellation_checks{0};
+    std::thread consumer([&]() {
+        store.GetBatch(request, &cancelled_response, [&]() {
+            cancellation_checks.fetch_add(1, std::memory_order_relaxed);
+            return cancelled.load(std::memory_order_acquire);
+        });
+    });
+
+    for (int attempt = 0;
+         attempt < 500 &&
+         cancellation_checks.load(std::memory_order_relaxed) < 2;
+         ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    Require(cancellation_checks.load(std::memory_order_relaxed) >= 2,
+            "GetBatch reached its cancellation-aware wait");
+    cancelled.store(true, std::memory_order_release);
+    rl::training::v1::PushSamplesReq push_request;
+    push_request.set_credit_id(credit.credit_id());
+    *push_request.mutable_batch() = batch;
+    rl::training::v1::PushSamplesRsp push_response;
+    store.Push(push_request, &push_response);
+    Require(push_response.result() == rl::training::v1::PUSH_RESULT_ACCEPTED,
+            "sample arrives in the wake-up that observes cancellation");
+    consumer.join();
+
+    Require(cancelled_response.result() ==
+                rl::training::v1::GET_BATCH_RESULT_REJECTED &&
+                cancelled_response.delivery_id().empty(),
+            "cancelled GetBatch returns without a delivery identity");
+    rl::training::v1::DistributorStatusRsp status;
+    store.GetStatus({}, &status);
+    Require(status.leased_samples() == 0 &&
+                status.ready_queue_samples() == 1,
+            "cancelled late arrival remains READY with no hidden lease");
+
+    const auto recovered = Get(store, 1, 100, 100, 0);
+    Require(recovered.result() ==
+                rl::training::v1::GET_BATCH_RESULT_LEASED &&
+                recovered.batches(0).batch_id() == batch.batch_id(),
+            "next request leases the exact late-arrival payload");
+    Ack(store, recovered.delivery_id(),
+        rl::training::v1::ACK_DISPOSITION_SHUTDOWN_UNTRAINED);
+}
+
+void TestCancellationDuringAssemblyRollsBackExactly() {
+    SampleStore store(TestConfig());
+    const auto batch = MakeBatch("cancel-before-commit", 12, 1);
+    Require(Push(store, batch).result() ==
+                rl::training::v1::PUSH_RESULT_ACCEPTED,
+            "pre-commit cancellation batch is ready");
+
+    const auto request = MakeGetBatchRequest(12, 100, 100, 0);
+    int cancellation_checks = 0;
+    rl::training::v1::GetBatchRsp cancelled_response;
+    store.GetBatch(request, &cancelled_response, [&]() {
+        return ++cancellation_checks >= 3;
+    });
+    Require(cancelled_response.result() ==
+                rl::training::v1::GET_BATCH_RESULT_REJECTED &&
+                cancelled_response.delivery_id().empty(),
+            "cancellation after assembly rejects before lease commit");
+
+    rl::training::v1::DistributorStatusRsp status;
+    store.GetStatus({}, &status);
+    Require(status.ready_queue_samples() == 12 &&
+                status.ready_queue_fragments() == 1 &&
+                status.leased_samples() == 0 &&
+                status.target_hit_count() == 0,
+            "pre-commit cancellation restores READY accounting exactly");
+    const auto recovered = Get(store, 12, 100, 100, 0);
+    Require(recovered.result() ==
+                rl::training::v1::GET_BATCH_RESULT_LEASED &&
+                recovered.batches(0).batch_id() == batch.batch_id(),
+            "rollback preserves FIFO identity for the next request");
+    Ack(store, recovered.delivery_id(),
+        rl::training::v1::ACK_DISPOSITION_SHUTDOWN_UNTRAINED);
+}
+
+void TestAlreadyExpiredHandlerCannotLeaseReadySamples() {
+    SampleStore store(TestConfig());
+    Require(Push(store, MakeBatch("expired-before-lock", 1, 1)).result() ==
+                rl::training::v1::PUSH_RESULT_ACCEPTED,
+            "already-expired handler sample is ready");
+    const auto request = MakeGetBatchRequest(1, 100, 100, 0);
+    rl::training::v1::GetBatchRsp response;
+    store.GetBatch(request, &response, []() { return true; });
+    Require(response.result() ==
+                rl::training::v1::GET_BATCH_RESULT_REJECTED &&
+                response.delivery_id().empty(),
+            "first post-lock cancellation fence rejects the handler");
+    rl::training::v1::DistributorStatusRsp status;
+    store.GetStatus({}, &status);
+    Require(status.ready_queue_samples() == 1 &&
+                status.leased_samples() == 0,
+            "a handler expired before mutex acquisition creates no lease");
+}
+
+void TestExpiredRequestCannotLeaseReadySamples() {
+    SampleStore store(TestConfig());
+    Require(Push(store, MakeBatch("deadline-before-lease", 1, 1)).result() ==
+                rl::training::v1::PUSH_RESULT_ACCEPTED,
+            "deadline test sample is ready");
+    const auto request = MakeGetBatchRequest(1, 5, 100, 0);
+    int cancellation_checks = 0;
+    rl::training::v1::GetBatchRsp timed_out;
+    store.GetBatch(request, &timed_out, [&]() {
+        if (++cancellation_checks == 2) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        }
+        return false;
+    });
+    Require(timed_out.result() ==
+                rl::training::v1::GET_BATCH_RESULT_TIMEOUT &&
+                timed_out.delivery_id().empty(),
+            "elapsed request deadline prevents a ready-sample lease");
+    rl::training::v1::DistributorStatusRsp status;
+    store.GetStatus({}, &status);
+    Require(status.ready_queue_samples() == 1 &&
+                status.leased_samples() == 0 &&
+                status.empty_timeout_count() == 1,
+            "deadline fence leaves no hidden lease and records one timeout");
+}
+
+void TestStatusLatencyAtObservedProductionScale() {
+    DistributorConfig config = TestConfig();
+    config.max_queue_samples = 12000;
+    config.max_queue_fragments = 12000;
+    config.max_dedup_entries = 30000;
+    config.credit_ttl_ms = 60000;
+    SampleStore store(config);
+    Require(Upsert(store, MakeDemand(1, 12000, 12000, 1751, 1751, 60000))
+                .result() ==
+                rl::training::v1::SAMPLE_DEMAND_RESULT_APPLIED,
+            "scale-test demand is applied");
+
+    constexpr int kTerminalCreditCount = 20000;
+    const auto terminal_batch = MakeBatch("status-terminal", 1, 1);
+    for (int index = 0; index < kTerminalCreditCount; ++index) {
+        const auto credit = Acquire(
+            store,
+            MakeCreditRequest(terminal_batch,
+                              "status-terminal-request-" +
+                                  std::to_string(index)));
+        Require(credit.result() ==
+                    rl::training::v1::SAMPLE_CREDIT_RESULT_GRANTED,
+                "scale-test credit is granted");
+        Require(ReleaseCredit(store, credit, terminal_batch).state() ==
+                    rl::training::v1::SAMPLE_CREDIT_STATE_RELEASED,
+                "scale-test credit becomes terminal");
+    }
+
+    constexpr int kBehaviorVersionCount = 1752;
+    for (int version = 0; version < kBehaviorVersionCount; ++version) {
+        const auto batch = MakeBatch(
+            "status-policy-" + std::to_string(version), 1, version + 2,
+            static_cast<uint64_t>(version),
+            static_cast<uint64_t>(version));
+        const auto credit = Acquire(store, MakeCreditRequest(batch));
+        Require(credit.result() ==
+                    rl::training::v1::SAMPLE_CREDIT_RESULT_GRANTED,
+                "behavior-version credit is granted");
+        rl::training::v1::PushSamplesReq request;
+        request.set_credit_id(credit.credit_id());
+        *request.mutable_batch() = batch;
+        rl::training::v1::PushSamplesRsp response;
+        store.Push(request, &response);
+        Require(response.result() == rl::training::v1::PUSH_RESULT_ACCEPTED,
+                "behavior-version batch is accepted");
+    }
+
+    constexpr int kAdditionalReadyBatchCount = 8192;
+    for (int index = 0; index < kAdditionalReadyBatchCount; ++index) {
+        const auto batch = MakeBatch(
+            "status-ready-" + std::to_string(index), 1,
+            kBehaviorVersionCount + index + 2, 1751,
+            kBehaviorVersionCount + index);
+        const auto credit = Acquire(store, MakeCreditRequest(batch));
+        Require(credit.result() ==
+                    rl::training::v1::SAMPLE_CREDIT_RESULT_GRANTED,
+                "large READY-set credit is granted");
+        rl::training::v1::PushSamplesReq request;
+        request.set_credit_id(credit.credit_id());
+        *request.mutable_batch() = batch;
+        rl::training::v1::PushSamplesRsp response;
+        store.Push(request, &response);
+        Require(response.result() == rl::training::v1::PUSH_RESULT_ACCEPTED,
+                "large READY-set batch is accepted");
+    }
+
+    constexpr int kStatusReads = 25;
+    rl::training::v1::DistributorStatusRsp status;
+    const auto started_at = std::chrono::steady_clock::now();
+    for (int index = 0; index < kStatusReads; ++index) {
+        store.GetStatus({}, &status);
+    }
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started_at)
+            .count();
+    Require(status.credit_release_count() == kTerminalCreditCount &&
+                status.reserved_samples() == 0 &&
+                status.behavior_versions_size() == kBehaviorVersionCount &&
+                status.ready_queue_samples() ==
+                    kBehaviorVersionCount + kAdditionalReadyBatchCount,
+            "large status snapshot preserves exact accounting");
+    Require(elapsed_ms < 2000,
+            "25 status snapshots at observed scale complete below 2s, got " +
+                std::to_string(elapsed_ms) + "ms");
+
+    std::atomic<bool> stop_status_polling{false};
+    std::atomic<int64_t> concurrent_status_reads{0};
+    std::thread status_poller([&]() {
+        rl::training::v1::DistributorStatusRsp concurrent_status;
+        while (!stop_status_polling.load(std::memory_order_acquire)) {
+            store.GetStatus({}, &concurrent_status);
+            concurrent_status_reads.fetch_add(1, std::memory_order_release);
+        }
+    });
+    for (int attempt = 0;
+         attempt < 500 &&
+         concurrent_status_reads.load(std::memory_order_acquire) < 5;
+         ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    Require(concurrent_status_reads.load(std::memory_order_acquire) >= 5,
+            "status poller is active before data-plane latency measurement");
+
+    constexpr int kDataPlaneCycles = 128;
+    int64_t maximum_get_us = 0;
+    int64_t maximum_ack_us = 0;
+    int64_t maximum_credit_us = 0;
+    int64_t maximum_push_us = 0;
+    auto get_request = MakeGetBatchRequest(1, 200, 1000, 1751);
+    get_request.mutable_freshness()->set_max_version_lag(1751);
+    for (int index = 0; index < kDataPlaneCycles; ++index) {
+        rl::training::v1::GetBatchRsp delivery;
+        const auto get_started_at = std::chrono::steady_clock::now();
+        store.GetBatch(get_request, &delivery, []() { return false; });
+        maximum_get_us = std::max(
+            maximum_get_us,
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - get_started_at)
+                .count());
+        Require(delivery.result() ==
+                    rl::training::v1::GET_BATCH_RESULT_LEASED,
+                "GetBatch meets its 200ms deadline during status polling");
+
+        const auto ack_started_at = std::chrono::steady_clock::now();
+        const auto ack = Ack(
+            store, delivery.delivery_id(),
+            rl::training::v1::ACK_DISPOSITION_SHUTDOWN_UNTRAINED);
+        maximum_ack_us = std::max(
+            maximum_ack_us,
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - ack_started_at)
+                .count());
+        Require(ack.result() == rl::training::v1::DELIVERY_RESULT_APPLIED,
+                "Ack completes during status polling");
+
+        const auto replacement = MakeBatch(
+            "status-replacement-" + std::to_string(index), 1,
+            kBehaviorVersionCount + kAdditionalReadyBatchCount + index + 2,
+            1751,
+            kBehaviorVersionCount + kAdditionalReadyBatchCount + index);
+        const auto credit_started_at = std::chrono::steady_clock::now();
+        const auto credit = Acquire(store, MakeCreditRequest(replacement));
+        maximum_credit_us = std::max(
+            maximum_credit_us,
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - credit_started_at)
+                .count());
+        Require(credit.result() ==
+                    rl::training::v1::SAMPLE_CREDIT_RESULT_GRANTED,
+                "AcquireCredit completes during status polling");
+
+        rl::training::v1::PushSamplesReq push_request;
+        push_request.set_credit_id(credit.credit_id());
+        *push_request.mutable_batch() = replacement;
+        rl::training::v1::PushSamplesRsp push_response;
+        const auto push_started_at = std::chrono::steady_clock::now();
+        store.Push(push_request, &push_response);
+        maximum_push_us = std::max(
+            maximum_push_us,
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - push_started_at)
+                .count());
+        Require(push_response.result() ==
+                    rl::training::v1::PUSH_RESULT_ACCEPTED,
+                "Push completes during status polling");
+    }
+    stop_status_polling.store(true, std::memory_order_release);
+    status_poller.join();
+
+    constexpr int64_t kMaximumDataPlaneLatencyUs = 200000;
+    const int64_t status_reads_during_data_plane =
+        concurrent_status_reads.load(std::memory_order_acquire);
+    Require(status_reads_during_data_plane >= 5,
+            "data-plane operations overlap status projections");
+    Require(maximum_get_us < kMaximumDataPlaneLatencyUs &&
+                maximum_ack_us < kMaximumDataPlaneLatencyUs &&
+                maximum_credit_us < kMaximumDataPlaneLatencyUs &&
+                maximum_push_us < kMaximumDataPlaneLatencyUs,
+            "status polling keeps every data-plane operation below 200ms: "
+            "get=" +
+                std::to_string(maximum_get_us) + "us ack=" +
+                std::to_string(maximum_ack_us) + "us credit=" +
+                std::to_string(maximum_credit_us) + "us push=" +
+                std::to_string(maximum_push_us) + "us");
+    std::cout << "status_concurrency: reads="
+              << status_reads_during_data_plane
+              << " max_get_us=" << maximum_get_us
+              << " max_ack_us=" << maximum_ack_us
+              << " max_credit_us=" << maximum_credit_us
+              << " max_push_us=" << maximum_push_us << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -790,6 +1153,11 @@ int main() {
     TestRenewExpiryAndSingleConsumer();
     TestDemandCreditFlowControl();
     TestPhysicalCapacityWaitIsDistinct();
+    TestCancelledGetCannotCreateHiddenLease();
+    TestCancellationDuringAssemblyRollsBackExactly();
+    TestAlreadyExpiredHandlerCannotLeaseReadySamples();
+    TestExpiredRequestCannotLeaseReadySamples();
+    TestStatusLatencyAtObservedProductionScale();
     std::cout << "sample_store_contract: PASS" << std::endl;
     return 0;
 }

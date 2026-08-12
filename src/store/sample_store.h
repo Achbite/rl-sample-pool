@@ -10,8 +10,11 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <queue>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 class SampleStore {
 public:
@@ -98,6 +101,18 @@ private:
         int64_t expires_at_unix_ms = 0;
         rl::training::v1::SampleCreditState state =
             rl::training::v1::SAMPLE_CREDIT_STATE_UNSPECIFIED;
+    };
+
+    struct CreditExpiry {
+        int64_t expires_at_unix_ms = 0;
+        std::string credit_id;
+    };
+
+    struct CreditExpiryLater {
+        bool operator()(const CreditExpiry& left,
+                        const CreditExpiry& right) const {
+            return left.expires_at_unix_ms > right.expires_at_unix_ms;
+        }
     };
 
     struct PolicyCounters {
@@ -190,7 +205,11 @@ private:
         const BatchFingerprint& fingerprint);
     const DeliveryRecord* DeliveryHistoryLocked(
         const std::string& delivery_id) const;
-    void FillStatusLocked(rl::training::v1::DistributorStatusRsp* response) const;
+    void FillStatusScalarsLocked(
+        rl::training::v1::DistributorStatusRsp* response) const;
+    static void AppendBehaviorVersions(
+        const std::vector<PolicyCounters>& policy_snapshot,
+        rl::training::v1::DistributorStatusRsp* response);
     void FillDeliveryResponseLocked(
         rl::training::v1::DeliveryRsp* response) const;
     bool PolicyMatchesFreshnessLocked(
@@ -233,6 +252,11 @@ private:
     DemandState active_demand_;
     std::unordered_map<std::string, CreditRecord> credits_by_id_;
     std::unordered_map<std::string, std::string> credit_id_by_request_id_;
+    std::unordered_set<std::string> reserved_credit_ids_;
+    std::priority_queue<CreditExpiry,
+                        std::vector<CreditExpiry>,
+                        CreditExpiryLater>
+        credit_expiries_;
     std::deque<std::string> terminal_credit_order_;
     int64_t reserved_samples_ = 0;
     int64_t reserved_fragments_ = 0;

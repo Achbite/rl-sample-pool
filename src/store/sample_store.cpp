@@ -661,6 +661,7 @@ void SampleStore::ReleaseReservationLocked(
         reserved_samples_ -= credit->request.sample_count();
         reserved_fragments_ -= credit->request.fragment_count();
         reserved_estimated_bytes_ -= credit->request.estimated_bytes();
+        reserved_credit_ids_.erase(credit->credit_id);
         terminal_credit_order_.push_back(credit->credit_id);
     }
     credit->state = state;
@@ -688,13 +689,18 @@ void SampleStore::TrimTerminalCreditHistoryLocked() {
 }
 
 void SampleStore::RevokeCreditsLocked() {
-    for (auto& [id, credit] : credits_by_id_) {
-        (void)id;
-        if (credit.state == rl::training::v1::SAMPLE_CREDIT_STATE_RESERVED) {
-            ReleaseReservationLocked(
-                &credit, rl::training::v1::SAMPLE_CREDIT_STATE_REVOKED);
-            ++credit_revoke_count_;
+    while (!reserved_credit_ids_.empty()) {
+        const std::string credit_id = *reserved_credit_ids_.begin();
+        const auto found = credits_by_id_.find(credit_id);
+        if (found == credits_by_id_.end() ||
+            found->second.state !=
+                rl::training::v1::SAMPLE_CREDIT_STATE_RESERVED) {
+            reserved_credit_ids_.erase(credit_id);
+            continue;
         }
+        ReleaseReservationLocked(
+            &found->second, rl::training::v1::SAMPLE_CREDIT_STATE_REVOKED);
+        ++credit_revoke_count_;
     }
     TrimTerminalCreditHistoryLocked();
     cv_.notify_all();
@@ -702,12 +708,18 @@ void SampleStore::RevokeCreditsLocked() {
 
 void SampleStore::ExpireFlowControlLocked() {
     const int64_t now = NowMs();
-    for (auto& [id, credit] : credits_by_id_) {
-        (void)id;
-        if (credit.state == rl::training::v1::SAMPLE_CREDIT_STATE_RESERVED &&
-            credit.expires_at_unix_ms <= now) {
+    while (!credit_expiries_.empty() &&
+           credit_expiries_.top().expires_at_unix_ms <= now) {
+        const CreditExpiry expiry = credit_expiries_.top();
+        credit_expiries_.pop();
+        const auto found = credits_by_id_.find(expiry.credit_id);
+        if (found != credits_by_id_.end() &&
+            found->second.state ==
+                rl::training::v1::SAMPLE_CREDIT_STATE_RESERVED &&
+            found->second.expires_at_unix_ms == expiry.expires_at_unix_ms) {
             ReleaseReservationLocked(
-                &credit, rl::training::v1::SAMPLE_CREDIT_STATE_EXPIRED);
+                &found->second,
+                rl::training::v1::SAMPLE_CREDIT_STATE_EXPIRED);
             ++credit_expire_count_;
         }
     }
@@ -1045,6 +1057,10 @@ void SampleStore::AcquireCredit(
     credit_id_by_request_id_[request.request_id()] = credit.credit_id;
     const std::string credit_id = credit.credit_id;
     credits_by_id_[credit_id] = std::move(credit);
+    reserved_credit_ids_.insert(credit_id);
+    credit_expiries_.push(
+        CreditExpiry{credits_by_id_.at(credit_id).expires_at_unix_ms,
+                     credit_id});
     ++credit_grant_count_;
     response->Clear();
     FillCreditGrantLocked(credits_by_id_.at(credit_id), response);
@@ -1295,6 +1311,46 @@ void SampleStore::GetBatch(
         response->set_queue_size(ready_samples_);
         return;
     }
+
+    const auto cancellation_requested = [&]() {
+        return is_cancelled && is_cancelled();
+    };
+    const auto wait_deadline_reached = [&]() {
+        return std::chrono::steady_clock::now() >= wait_deadline;
+    };
+    const auto finish_without_lease = [&](bool cancelled) {
+        response->Clear();
+        FillServiceIdentity(response->mutable_distributor());
+        if (cancelled) {
+            response->set_ret_code(-1);
+            response->set_result(
+                rl::training::v1::GET_BATCH_RESULT_REJECTED);
+            response->set_message("request cancelled before lease commit");
+        } else {
+            ++empty_timeout_count_;
+            response->set_ret_code(1);
+            response->set_result(
+                rl::training::v1::GET_BATCH_RESULT_TIMEOUT);
+            response->set_message(
+                "compatible fresh samples not available before deadline");
+        }
+        response->set_queue_size(ready_samples_);
+        response->set_wait_ms(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start)
+                .count());
+    };
+    const auto abort_before_lease = [&]() {
+        const bool cancelled = cancellation_requested();
+        if (!cancelled && !wait_deadline_reached()) return false;
+        finish_without_lease(cancelled);
+        return true;
+    };
+
+    // A request can spend its entire RPC deadline waiting for this mutex.  It
+    // must not create a lease merely because samples are already available
+    // once the lock is acquired.
+    if (abort_before_lease()) return;
     if (has_lease_) {
         ++consumer_busy_count_;
         response->set_ret_code(2);
@@ -1316,13 +1372,7 @@ void SampleStore::GetBatch(
     };
     while (!ready_for_assembly() &&
            std::chrono::steady_clock::now() < wait_deadline) {
-        if (is_cancelled && is_cancelled()) {
-            response->set_ret_code(-1);
-            response->set_result(rl::training::v1::GET_BATCH_RESULT_REJECTED);
-            response->set_message("request cancelled");
-            response->set_queue_size(ready_samples_);
-            return;
-        }
+        if (abort_before_lease()) return;
         cv_.wait_until(lock, std::min(
                                 wait_deadline,
                                 std::chrono::steady_clock::now() +
@@ -1338,27 +1388,30 @@ void SampleStore::GetBatch(
             return;
         }
     }
+    // Samples may arrive in the same wake-up that observes the RPC deadline.
+    // Re-check before moving any payload out of READY.
+    if (abort_before_lease()) return;
     if (!ready_for_assembly()) {
-        ++empty_timeout_count_;
-        response->set_ret_code(1);
-        response->set_result(rl::training::v1::GET_BATCH_RESULT_TIMEOUT);
-        response->set_message(
-            "compatible fresh samples not available before deadline");
-        response->set_queue_size(ready_samples_);
-        response->set_wait_ms(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - start)
-                .count());
+        finish_without_lease(false);
         return;
     }
 
     Lease new_lease;
     new_lease.consumer_instance_id = ServiceKey(request.consumer());
-    new_lease.delivery_id =
-        instance_id_ + "-delivery-" + std::to_string(next_delivery_seq_++);
-    new_lease.deadline = std::chrono::steady_clock::now() +
-                         std::chrono::milliseconds(lease_timeout_ms);
-    new_lease.deadline_unix_ms = NowMs() + lease_timeout_ms;
+
+    const auto rollback_assembly = [&]() {
+        for (auto it = new_lease.batches.rbegin();
+             it != new_lease.batches.rend(); ++it) {
+            auto& counters = policy_counters_[it->policy_key];
+            counters.ready_samples += it->sample_count;
+            ++counters.ready_fragments;
+            ready_by_policy_[it->policy_key].push_front(std::move(*it));
+        }
+        ready_samples_ += new_lease.sample_count;
+        ready_fragments_ +=
+            static_cast<int64_t>(new_lease.batches.size());
+        ready_estimated_bytes_ += new_lease.estimated_bytes;
+    };
 
     while (new_lease.sample_count < target_samples ||
            mode == rl::training::v1::BATCH_ASSEMBLY_MODE_DRAIN_AVAILABLE) {
@@ -1389,33 +1442,14 @@ void SampleStore::GetBatch(
     if (new_lease.batches.empty() ||
         (mode == rl::training::v1::BATCH_ASSEMBLY_MODE_TARGET_BOUNDED &&
          new_lease.sample_count < target_samples)) {
-        for (auto it = new_lease.batches.rbegin();
-             it != new_lease.batches.rend(); ++it) {
-            auto& counters = policy_counters_[it->policy_key];
-            counters.ready_samples += it->sample_count;
-            ++counters.ready_fragments;
-            ready_by_policy_[it->policy_key].push_front(std::move(*it));
-        }
-        ready_samples_ += new_lease.sample_count;
-        ready_fragments_ +=
-            static_cast<int64_t>(new_lease.batches.size());
-        ready_estimated_bytes_ += new_lease.estimated_bytes;
+        rollback_assembly();
         response->set_ret_code(-1);
         response->set_result(rl::training::v1::GET_BATCH_RESULT_REJECTED);
         response->set_message("bounded assembly invariant violated");
         response->set_queue_size(ready_samples_);
         return;
     }
-    for (const auto& stored : new_lease.batches) {
-        auto& counters = policy_counters_[stored.policy_key];
-        counters.leased_samples += stored.sample_count;
-        ++counters.leased_fragments;
-    }
-    if (new_lease.sample_count >= target_samples) {
-        ++target_hit_count_;
-    } else {
-        ++partial_get_count_;
-    }
+
     uint64_t minimum_version = 0;
     uint64_t maximum_version = 0;
     int64_t oldest_created_at = 0;
@@ -1435,6 +1469,32 @@ void SampleStore::GetBatch(
             oldest_created_at = std::min(oldest_created_at, created_at);
             newest_created_at = std::max(newest_created_at, created_at);
         }
+    }
+
+    // Building the response can itself be material for a large exact batch.
+    // Commit is therefore the last state-changing step, behind one final
+    // cancellation/deadline fence.  A failed fence restores exact FIFO order.
+    const bool cancelled_before_commit = cancellation_requested();
+    if (cancelled_before_commit || wait_deadline_reached()) {
+        rollback_assembly();
+        finish_without_lease(cancelled_before_commit);
+        return;
+    }
+
+    new_lease.delivery_id =
+        instance_id_ + "-delivery-" + std::to_string(next_delivery_seq_++);
+    new_lease.deadline = std::chrono::steady_clock::now() +
+                         std::chrono::milliseconds(lease_timeout_ms);
+    new_lease.deadline_unix_ms = NowMs() + lease_timeout_ms;
+    for (const auto& stored : new_lease.batches) {
+        auto& counters = policy_counters_[stored.policy_key];
+        counters.leased_samples += stored.sample_count;
+        ++counters.leased_fragments;
+    }
+    if (new_lease.sample_count >= target_samples) {
+        ++target_hit_count_;
+    } else {
+        ++partial_get_count_;
     }
     response->set_ret_code(0);
     response->set_result(rl::training::v1::GET_BATCH_RESULT_LEASED);
@@ -1704,7 +1764,7 @@ void SampleStore::RenewLease(const rl::training::v1::RenewLeaseReq& request,
     response->set_lease_deadline_unix_ms(lease_.deadline_unix_ms);
 }
 
-void SampleStore::FillStatusLocked(
+void SampleStore::FillStatusScalarsLocked(
     rl::training::v1::DistributorStatusRsp* response) const {
     FillContractIdentity(response->mutable_contract());
     FillServiceIdentity(response->mutable_distributor());
@@ -1738,22 +1798,6 @@ void SampleStore::FillStatusLocked(
     response->set_partial_get_count(partial_get_count_);
     response->set_empty_timeout_count(empty_timeout_count_);
     response->set_last_error(last_error_);
-    for (const auto& [key, counters] : policy_counters_) {
-        (void)key;
-        auto* status = response->add_behavior_versions();
-        *status->mutable_behavior_policy() = counters.behavior_policy;
-        status->set_ready_samples(counters.ready_samples);
-        status->set_ready_fragments(counters.ready_fragments);
-        status->set_leased_samples(counters.leased_samples);
-        status->set_leased_fragments(counters.leased_fragments);
-        status->set_acked_samples(counters.acked_samples);
-        status->set_acked_fragments(counters.acked_fragments);
-        status->set_trained_samples(counters.trained_samples);
-        status->set_stale_samples(counters.stale_samples);
-        status->set_invalid_samples(counters.invalid_samples);
-        status->set_shutdown_untrained_samples(
-            counters.shutdown_untrained_samples);
-    }
     response->set_trained_sample_count(trained_sample_count_);
     response->set_stale_sample_count(stale_sample_count_);
     response->set_invalid_sample_count(invalid_sample_count_);
@@ -1767,7 +1811,8 @@ void SampleStore::FillStatusLocked(
     response->set_consumer_busy_count(consumer_busy_count_);
     response->set_ingress_ready(true);
     response->set_pool_ready(true);
-    response->set_timestamp_unix_ms(NowMs());
+    const int64_t snapshot_time_unix_ms = NowMs();
+    response->set_timestamp_unix_ms(snapshot_time_unix_ms);
     bool has_ready = false;
     int64_t oldest_created_at = 0;
     uint64_t minimum_version = 0;
@@ -1776,32 +1821,34 @@ void SampleStore::FillStatusLocked(
         if (queue.empty()) continue;
         const auto policy = behavior_policy_by_key_.find(key);
         if (policy == behavior_policy_by_key_.end()) continue;
-        for (const auto& stored : queue) {
-            const int64_t created_at = stored.batch.created_at_unix_ms();
-            const uint64_t version = policy->second.model_version();
-            if (!has_ready) {
-                oldest_created_at = created_at;
-                minimum_version = maximum_version = version;
-                has_ready = true;
-            } else {
-                oldest_created_at = std::min(oldest_created_at, created_at);
-                minimum_version = std::min(minimum_version, version);
-                maximum_version = std::max(maximum_version, version);
-            }
+        // Per-policy queues are consumed and stale-expired from the front, so
+        // the front element is the READY age representative for that policy.
+        const int64_t created_at =
+            queue.front().batch.created_at_unix_ms();
+        const uint64_t version = policy->second.model_version();
+        if (!has_ready) {
+            oldest_created_at = created_at;
+            minimum_version = maximum_version = version;
+            has_ready = true;
+        } else {
+            oldest_created_at = std::min(oldest_created_at, created_at);
+            minimum_version = std::min(minimum_version, version);
+            maximum_version = std::max(maximum_version, version);
         }
     }
     if (has_ready) {
         response->set_oldest_ready_sample_age_ms(
-            std::max<int64_t>(0, NowMs() - oldest_created_at));
+            std::max<int64_t>(0,
+                              snapshot_time_unix_ms - oldest_created_at));
         response->set_minimum_ready_model_version(minimum_version);
-    response->set_maximum_ready_model_version(maximum_version);
+        response->set_maximum_ready_model_version(maximum_version);
     }
     response->set_active_demand_count(has_active_demand_ ? 1 : 0);
     if (has_active_demand_) {
         response->set_active_demand_epoch(
             active_demand_.demand.demand_epoch());
         response->set_active_demand_age_ms(std::max<int64_t>(
-            0, NowMs() - active_demand_.created_at_unix_ms));
+            0, snapshot_time_unix_ms - active_demand_.created_at_unix_ms));
     }
     response->set_reserved_samples(reserved_samples_);
     response->set_reserved_fragments(reserved_fragments_);
@@ -1822,13 +1869,45 @@ void SampleStore::FillStatusLocked(
     response->set_demand_release_count(demand_release_count_);
 }
 
+void SampleStore::AppendBehaviorVersions(
+    const std::vector<PolicyCounters>& policy_snapshot,
+    rl::training::v1::DistributorStatusRsp* response) {
+    for (const auto& counters : policy_snapshot) {
+        auto* status = response->add_behavior_versions();
+        *status->mutable_behavior_policy() = counters.behavior_policy;
+        status->set_ready_samples(counters.ready_samples);
+        status->set_ready_fragments(counters.ready_fragments);
+        status->set_leased_samples(counters.leased_samples);
+        status->set_leased_fragments(counters.leased_fragments);
+        status->set_acked_samples(counters.acked_samples);
+        status->set_acked_fragments(counters.acked_fragments);
+        status->set_trained_samples(counters.trained_samples);
+        status->set_stale_samples(counters.stale_samples);
+        status->set_invalid_samples(counters.invalid_samples);
+        status->set_shutdown_untrained_samples(
+            counters.shutdown_untrained_samples);
+    }
+}
+
 void SampleStore::GetStatus(
     const rl::training::v1::DistributorStatusReq&,
     rl::training::v1::DistributorStatusRsp* response) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    ReclaimExpiredLeaseLocked();
-    ExpireFlowControlLocked();
-    FillStatusLocked(response);
+    std::vector<PolicyCounters> policy_snapshot;
+    response->Clear();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ReclaimExpiredLeaseLocked();
+        ExpireFlowControlLocked();
+        policy_snapshot.reserve(policy_counters_.size());
+        for (const auto& [key, counters] : policy_counters_) {
+            (void)key;
+            policy_snapshot.push_back(counters);
+        }
+        FillStatusScalarsLocked(response);
+    }
+    // Repeated protobuf allocation/copying is intentionally outside the
+    // global store mutex so status polling cannot block Push/GetBatch/Ack.
+    AppendBehaviorVersions(policy_snapshot, response);
 }
 
 const std::string& SampleStore::instance_id() const {
