@@ -262,7 +262,7 @@ bool LoadDistributorConfig(const std::string& yaml_path,
         parsed.credit_wait_retry_after_ms <= 0 ||
         parsed.max_demand_ttl_ms < parsed.credit_ttl_ms ||
         parsed.contract.package_name != "rl-contracts" ||
-        parsed.contract.package_version != "0.10.0" ||
+        parsed.contract.package_version != "0.11.0" ||
         !IsLowerSha256(parsed.contract.source_digest) ||
         !IsLowerSha256(parsed.contract.artifact_digest) ||
         parsed.contract.platform.empty() ||

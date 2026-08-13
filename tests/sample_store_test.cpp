@@ -16,9 +16,9 @@
 namespace {
 
 constexpr char kSourceDigest[] =
-    "fc1bf2e3dfd804431f2528d8da53227e55ca9b58b32fc95327558d91cebb3b97";
+    "7e3eb7227e67a2a880130c9c82f87041691c0095f838a60f80abc1f387c1c5b3";
 constexpr char kArtifactDigest[] =
-    "d90083d97e377230f50c820d040a5d83ce7435dc88c4f948c222c86ac4a429ae";
+    "077ac6d61486fafd5f0430eeb05a492764b36e073282f6d7626d0414bb5b2ddf";
 constexpr char kGeneratorIdentity[] =
     "0eb73fc2cb675bdb34bf3db9c99dae62a82f93a5e3a72db84dcf3936464729c8";
 
@@ -77,7 +77,7 @@ void FillService(rl::common::v1::ServiceInstanceIdentity* service,
 
 void FillContract(rl::common::v1::ContractIdentity* contract) {
     contract->set_package_name("rl-contracts");
-    contract->set_package_version("0.10.0");
+    contract->set_package_version("0.11.0");
     SetDigest(contract->mutable_source_digest(), kSourceDigest);
     SetDigest(contract->mutable_artifact_digest(), kArtifactDigest);
     contract->set_platform("linux/arm64");
@@ -123,7 +123,7 @@ DistributorConfig TestConfig() {
     config.default_lease_timeout_ms = 100;
     config.max_fragment_samples = 128;
     config.contract.package_name = "rl-contracts";
-    config.contract.package_version = "0.10.0";
+    config.contract.package_version = "0.11.0";
     config.contract.source_digest = kSourceDigest;
     config.contract.artifact_digest = kArtifactDigest;
     config.contract.platform = "linux/arm64";
@@ -676,7 +676,7 @@ void TestRenewExpiryAndSingleConsumer() {
                 status.invalid_sample_count() == 12 &&
                 status.consumer_busy_count() == 1,
             "lease and disposition accounting closes exactly");
-    Require(status.contract().package_version() == "0.10.0" &&
+    Require(status.contract().package_version() == "0.11.0" &&
                 status.distributor().component() == "sample-distributor" &&
                 status.ready() && status.ingress_ready() &&
                 status.pool_ready(),

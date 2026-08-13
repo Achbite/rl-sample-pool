@@ -1,29 +1,37 @@
 # RL Sample Pool
 
-English | [简体中文](README.md)
+[简体中文](README.md) | English
 
-C++ sample-distribution artifact repository, currently at version `0.10.1`. For local training, `maze_sample_distributor` combines task-neutral Learner Demand, Producer Credit, sample ingress, and a single-consumer in-memory lease pool. It is supervised by the Learner image, is not a separate task container, and is not equivalent to Reverb.
+## 1. Build the 0.11.0 artifact
 
-## Build
-
-Build `rl-contracts` first, then run:
+Create the Contracts artifact first, then run the build from a clean Git savepoint:
 
 ```bash
+(cd ../rl-contracts && bash build_artifact.sh)
 bash build_artifact.sh
 ```
 
-Output directory:
+The script compiles the service and runs its tests. Output:
 
 ```text
-../.workspace/artifacts/rl-sample-pool/0.10.1/<platform>/
+../.workspace/artifacts/rl-sample-pool/0.11.0/<platform>/
 ```
 
-Creating a version for the first time requires a reviewed and committed clean
-Git savepoint. The build entrypoint refuses to create a new artifact from a
-dirty worktree. An existing artifact can only be reused when both source
-identity and every file checksum still match.
+## 2. Stage it into Learner
 
-Copy the artifact for the selected platform into `rl-learner/sample-pool/` before building the Learner image.
+Do not copy the binary manually. Use the Learner sync entry point:
+
+```bash
+(cd ../rl-learner && bash scripts/sync_runtime_artifacts.sh)
+```
+
+## 3. Run it directly
+
+```bash
+./maze_sample_distributor configs/distributor_config.yaml
+```
+
+During full training the Learner container supervises this process; no separate launch is required.
 
 ## License
 
