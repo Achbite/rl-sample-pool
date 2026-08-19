@@ -12,7 +12,7 @@ struct ContractConfig {
     std::string generator_identity;
 };
 
-struct DistributorConfig {
+struct SamplePoolConfig {
     int listen_port = 9100;
     int64_t max_queue_samples = 262144;
     int64_t max_queue_fragments = 4096;
@@ -23,10 +23,8 @@ struct DistributorConfig {
     int default_get_timeout_ms = 1000;
     int default_lease_timeout_ms = 10000;
     int delivery_history_size = 4096;
-    int credit_ttl_ms = 10000;
-    int credit_wait_retry_after_ms = 100;
-    int max_demand_ttl_ms = 60000;
     ContractConfig contract;
 };
 
-bool LoadDistributorConfig(const std::string& yaml_path, DistributorConfig& out_config);
+bool LoadSamplePoolConfig(const std::string& yaml_path,
+                          SamplePoolConfig& out_config);

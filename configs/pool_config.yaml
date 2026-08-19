@@ -4,23 +4,20 @@ server:
 queue:
   max_queue_samples: 262144
   max_queue_fragments: 4096
-  max_fragment_samples: 128  # whole-fragment assembly overshoot bound
+  max_fragment_samples: 128  # complete immutable fragment upper bound
   max_queue_estimated_bytes: 536870912
-  max_dedup_entries: 1000000  # 已完成 batch_id 的有界重试历史；活跃队列不受此值截断
+  max_dedup_entries: 1000000  # bounded terminal UID/digest retry history
   high_watermark_ratio: 0.8
   default_get_timeout_ms: 1000
   default_lease_timeout_ms: 10000
   delivery_history_size: 4096
-  credit_ttl_ms: 10000
-  credit_wait_retry_after_ms: 100
-  max_demand_ttl_ms: 60000
 
 # Exact rl-contracts artifact identity. A process must fail closed when this
 # identity is missing or differs from the mounted generated bindings.
 contract:
   package_name: rl-contracts
-  package_version: 0.11.0
-  source_digest: 7e3eb7227e67a2a880130c9c82f87041691c0095f838a60f80abc1f387c1c5b3
-  artifact_digest: 077ac6d61486fafd5f0430eeb05a492764b36e073282f6d7626d0414bb5b2ddf
+  package_version: 0.13.0
+  source_digest: 1fc3866efe7e5869cc1a7ed4bc86d58f9c1abedafd7012b9f5dae08246ff145d
+  artifact_digest: 5ce9dff294e3cab466e2e0f058192f9715530645a41b45851b4d798e19a9a5a7
   platform: linux/arm64
   generator_identity: 0eb73fc2cb675bdb34bf3db9c99dae62a82f93a5e3a72db84dcf3936464729c8

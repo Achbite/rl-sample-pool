@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config/config_loader.h"
+#include "store/sample_store_backend.h"
 #include "training.pb.h"
 
 #include <chrono>
@@ -9,30 +10,16 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
-#include <queue>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
-class SampleStore {
+class SamplePoolCoordinator {
 public:
-    explicit SampleStore(const DistributorConfig& config);
+    explicit SamplePoolCoordinator(const SamplePoolConfig& config);
 
-    void UpsertDemand(const rl::training::v1::UpsertSampleDemandReq& request,
-                      rl::training::v1::SampleDemandRsp* response);
-    void ReleaseDemand(const rl::training::v1::ReleaseSampleDemandReq& request,
-                       rl::training::v1::SampleDemandRsp* response);
-    void GetDemandStatus(
-        const rl::training::v1::GetSampleDemandStatusReq& request,
-        rl::training::v1::SampleDemandStatusRsp* response);
-    void AcquireCredit(
-        const rl::training::v1::AcquireSampleCreditReq& request,
-        rl::training::v1::SampleCreditGrant* response);
-    void ReleaseCredit(
-        const rl::training::v1::ReleaseSampleCreditReq& request,
-        rl::training::v1::ReleaseSampleCreditRsp* response);
     void Push(const rl::training::v1::PushSamplesReq& request,
               rl::training::v1::PushSamplesRsp* response);
     void GetBatch(const rl::training::v1::GetBatchReq& request,
@@ -44,36 +31,21 @@ public:
               rl::training::v1::DeliveryRsp* response);
     void RenewLease(const rl::training::v1::RenewLeaseReq& request,
                     rl::training::v1::DeliveryRsp* response);
-    void GetStatus(const rl::training::v1::DistributorStatusReq& request,
-                   rl::training::v1::DistributorStatusRsp* response);
+    void FinalizeSamplePool(
+        const rl::training::v1::FinalizeSamplePoolReq& request,
+        rl::training::v1::FinalizeSamplePoolRsp* response);
+    void GetStatus(const rl::training::v1::SamplePoolStatusReq& request,
+                   rl::training::v1::SamplePoolStatusRsp* response);
 
     const std::string& instance_id() const;
 
 private:
-    struct BatchFingerprint {
-        std::string payload_sha256;
-        uint64_t serialized_size = 0;
-
-        bool operator==(const BatchFingerprint& other) const {
-            return payload_sha256 == other.payload_sha256 &&
-                   serialized_size == other.serialized_size;
-        }
-    };
-
-    struct StoredBatch {
-        rl::training::v1::SampleBatch batch;
-        BatchFingerprint fingerprint;
-        std::string policy_key;
-        int64_t sample_count = 0;
-        int64_t estimated_bytes = 0;
-    };
-
     struct Lease {
         std::string delivery_id;
         std::string consumer_instance_id;
         std::chrono::steady_clock::time_point deadline;
         int64_t deadline_unix_ms = 0;
-        std::deque<StoredBatch> batches;
+        std::deque<StoredFragment> fragments;
         int64_t sample_count = 0;
         int64_t estimated_bytes = 0;
     };
@@ -84,35 +56,6 @@ private:
         rl::training::v1::AckDisposition disposition =
             rl::training::v1::ACK_DISPOSITION_UNSPECIFIED;
         std::string train_update_id;
-    };
-
-    struct DemandState {
-        rl::training::v1::SampleDemand demand;
-        std::string immutable_identity;
-        int64_t created_at_unix_ms = 0;
-    };
-
-    struct CreditRecord {
-        rl::training::v1::AcquireSampleCreditReq request;
-        std::string request_identity;
-        std::string credit_id;
-        std::string demand_id;
-        uint64_t demand_epoch = 0;
-        int64_t expires_at_unix_ms = 0;
-        rl::training::v1::SampleCreditState state =
-            rl::training::v1::SAMPLE_CREDIT_STATE_UNSPECIFIED;
-    };
-
-    struct CreditExpiry {
-        int64_t expires_at_unix_ms = 0;
-        std::string credit_id;
-    };
-
-    struct CreditExpiryLater {
-        bool operator()(const CreditExpiry& left,
-                        const CreditExpiry& right) const {
-            return left.expires_at_unix_ms > right.expires_at_unix_ms;
-        }
     };
 
     struct PolicyCounters {
@@ -129,6 +72,12 @@ private:
         int64_t shutdown_untrained_samples = 0;
     };
 
+    struct PolicyAvailability {
+        std::string policy_key;
+        int64_t sample_count = 0;
+        size_t first_fifo_index = 0;
+    };
+
     static int64_t NowMs();
     static std::string CreateInstanceId(const std::string& prefix);
     static int64_t CountSamples(const rl::training::v1::SampleBatch& batch);
@@ -137,7 +86,7 @@ private:
         const rl::training::v1::SampleBatch& batch,
         bool clear_payload_digest);
     static std::string Sha256Hex(const std::string& data);
-    static BatchFingerprint FingerprintBatch(
+    static SampleBatchFingerprint FingerprintBatch(
         const rl::training::v1::SampleBatch& batch);
     static bool IsSha256(const rl::common::v1::ContentDigest& digest);
     static bool IsServiceIdentityValid(
@@ -158,39 +107,19 @@ private:
         const rl::training::v1::TrainingSemanticsIdentity& semantics,
         std::string* error) const;
     bool ValidateBatchLocked(const rl::training::v1::SampleBatch& batch,
-                             std::string* error) const;
+                             std::string* error,
+                             rl::training::v1::PushResult* rejection) const;
     bool DeliveryBelongsToInstanceLocked(const std::string& delivery_id) const;
     bool CapacityAllowsLocked(int64_t samples,
                               int64_t fragments,
                               int64_t estimated_bytes) const;
-    bool DemandWindowAllowsLocked(int64_t samples,
-                                  int64_t fragments,
-                                  int64_t estimated_bytes) const;
+    bool CanMakeCapacityLocked(int64_t samples,
+                               int64_t fragments,
+                               int64_t estimated_bytes) const;
+    void EvictReadyUntilCapacityLocked(int64_t samples,
+                                       int64_t fragments,
+                                       int64_t estimated_bytes);
     rl::training::v1::PressureState PressureStateLocked() const;
-
-    bool ValidateDemandLocked(const rl::training::v1::SampleDemand& demand,
-                              std::string* error) const;
-    bool ValidateCreditRequestLocked(
-        const rl::training::v1::AcquireSampleCreditReq& request,
-        std::string* error) const;
-    bool CreditMatchesBatchLocked(
-        const CreditRecord& credit,
-        const rl::training::v1::SampleBatch& batch,
-        std::string* error) const;
-    static std::string DemandImmutableIdentity(
-        const rl::training::v1::SampleDemand& demand);
-    static std::string CreditRequestIdentity(
-        const rl::training::v1::AcquireSampleCreditReq& request);
-    void ExpireFlowControlLocked();
-    void RevokeCreditsLocked();
-    void ReleaseReservationLocked(CreditRecord* credit,
-                                  rl::training::v1::SampleCreditState state);
-    void TrimTerminalCreditHistoryLocked();
-    void FillDemandResponseLocked(
-        rl::training::v1::SampleDemandRsp* response) const;
-    void FillCreditGrantLocked(
-        const CreditRecord& credit,
-        rl::training::v1::SampleCreditGrant* response) const;
 
     void FillServiceIdentity(
         rl::common::v1::ServiceInstanceIdentity* identity) const;
@@ -202,65 +131,60 @@ private:
                                 const DeliveryRecord& record);
     void RememberCompletedBatchLocked(
         const std::string& batch_id,
-        const BatchFingerprint& fingerprint);
+        const SampleBatchFingerprint& fingerprint);
     const DeliveryRecord* DeliveryHistoryLocked(
         const std::string& delivery_id) const;
-    void FillStatusScalarsLocked(
-        rl::training::v1::DistributorStatusRsp* response) const;
-    static void AppendBehaviorVersions(
-        const std::vector<PolicyCounters>& policy_snapshot,
-        rl::training::v1::DistributorStatusRsp* response);
     void FillDeliveryResponseLocked(
         rl::training::v1::DeliveryRsp* response) const;
+    void FillFinalizeResponseLocked(
+        rl::training::v1::FinalizeSamplePoolRsp* response) const;
+
     bool PolicyMatchesFreshnessLocked(
         const rl::training::v1::BehaviorPolicyReference& policy,
         const rl::training::v1::SampleFreshnessPolicy& freshness) const;
-    int64_t ReadySamplesForFreshnessLocked(
+    bool FragmentEligibleLocked(
+        const StoredFragment& fragment,
         const rl::training::v1::SampleFreshnessPolicy& freshness,
-        const rl::training::v1::TrainingSemanticsIdentity& semantics) const;
-    std::string OldestCompatiblePolicyKeyLocked(
+        const rl::training::v1::TrainingSemanticsIdentity& semantics,
+        int64_t minimum_created_at_unix_ms) const;
+    std::vector<PolicyAvailability> EligibleAvailabilityLocked(
         const rl::training::v1::SampleFreshnessPolicy& freshness,
-        const rl::training::v1::TrainingSemanticsIdentity& semantics) const;
-    void ExpireStaleReadyLocked(
+        const rl::training::v1::TrainingSemanticsIdentity& semantics,
+        int64_t minimum_created_at_unix_ms) const;
+    std::string OldestEligiblePolicyLocked(
         const rl::training::v1::SampleFreshnessPolicy& freshness,
-        const rl::training::v1::TrainingSemanticsIdentity& semantics);
+        const rl::training::v1::TrainingSemanticsIdentity& semantics,
+        int64_t minimum_created_at_unix_ms,
+        int64_t minimum_samples) const;
 
-    DistributorConfig config_;
+    void FillStatusScalarsLocked(
+        rl::training::v1::SamplePoolStatusRsp* response) const;
+    static void AppendBehaviorSteps(
+        const std::vector<PolicyCounters>& policy_snapshot,
+        rl::training::v1::SamplePoolStatusRsp* response);
+
+    SamplePoolConfig config_;
     std::string instance_id_;
+    std::unique_ptr<ISampleStoreBackend> backend_;
 
     mutable std::mutex mutex_;
     std::condition_variable cv_;
-    std::map<std::string, std::deque<StoredBatch>> ready_by_policy_;
-    std::map<std::string, rl::training::v1::BehaviorPolicyReference>
-        behavior_policy_by_key_;
-    std::map<std::string, rl::training::v1::TrainingSemanticsIdentity>
-        training_semantics_by_key_;
     bool has_lease_ = false;
     Lease lease_;
 
-    std::unordered_map<std::string, BatchFingerprint> active_batch_fingerprints_;
-    std::unordered_map<std::string, BatchFingerprint> completed_batch_fingerprints_;
+    std::unordered_map<std::string, SampleBatchFingerprint>
+        active_batch_fingerprints_;
+    std::unordered_map<std::string, SampleBatchFingerprint>
+        completed_batch_fingerprints_;
     std::deque<std::string> completed_batch_order_;
     std::unordered_map<std::string, DeliveryRecord> delivery_history_;
     std::deque<std::string> delivery_history_order_;
     std::map<std::string, PolicyCounters> policy_counters_;
-    uint64_t next_delivery_seq_ = 1;
-    uint64_t next_credit_seq_ = 1;
-
-    bool has_active_demand_ = false;
-    bool draining_ = false;
-    DemandState active_demand_;
-    std::unordered_map<std::string, CreditRecord> credits_by_id_;
-    std::unordered_map<std::string, std::string> credit_id_by_request_id_;
-    std::unordered_set<std::string> reserved_credit_ids_;
-    std::priority_queue<CreditExpiry,
-                        std::vector<CreditExpiry>,
-                        CreditExpiryLater>
-        credit_expiries_;
-    std::deque<std::string> terminal_credit_order_;
-    int64_t reserved_samples_ = 0;
-    int64_t reserved_fragments_ = 0;
-    int64_t reserved_estimated_bytes_ = 0;
+    std::map<std::string, rl::training::v1::BehaviorPolicyReference>
+        behavior_policy_by_key_;
+    std::map<std::string, rl::training::v1::TrainingSemanticsIdentity>
+        training_semantics_by_key_;
+    uint64_t next_delivery_sequence_ = 1;
 
     int64_t ready_samples_ = 0;
     int64_t ready_fragments_ = 0;
@@ -290,21 +214,16 @@ private:
     int64_t partial_get_count_ = 0;
     int64_t empty_timeout_count_ = 0;
     int64_t consumer_busy_count_ = 0;
-    int64_t credit_request_count_ = 0;
-    int64_t credit_grant_count_ = 0;
-    int64_t credit_commit_count_ = 0;
-    int64_t credit_release_count_ = 0;
-    int64_t credit_expire_count_ = 0;
-    int64_t credit_revoke_count_ = 0;
-    int64_t credit_wait_no_demand_count_ = 0;
-    int64_t credit_wait_inflight_limit_count_ = 0;
-    int64_t credit_wait_capacity_count_ = 0;
-    int64_t credit_wait_draining_count_ = 0;
-    int64_t demand_upsert_count_ = 0;
-    int64_t demand_release_count_ = 0;
+    int64_t evicted_sample_count_ = 0;
+    int64_t evicted_fragment_count_ = 0;
 
-    int64_t latest_push_unix_ms_ = 0;
-    int64_t latest_consume_unix_ms_ = 0;
+    bool finalized_ = false;
+    std::string finalization_id_;
+    std::string finalization_consumer_key_;
+    int64_t finalized_at_unix_ms_ = 0;
+    int64_t finalized_sample_count_ = 0;
+    int64_t finalized_fragment_count_ = 0;
+
     int64_t latest_ack_unix_ms_ = 0;
     std::string last_error_;
 };

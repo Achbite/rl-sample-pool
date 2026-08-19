@@ -38,7 +38,9 @@ PY
 source_status="$(git -C "${repo_dir}" status --porcelain=v1)"
 source_id="${source_commit}"
 if test -n "${source_status}"; then
-    source_id="${source_commit}-dirty-${source_sha256:0:12}"
+    echo "refusing to create or reuse a sample-pool artifact from a dirty worktree" >&2
+    echo "commit the reviewed source first, then rerun this command" >&2
+    exit 1
 fi
 
 output_dir="${artifact_root}/${version}/${platform_dir}"
@@ -64,6 +66,8 @@ if not manifest_path.is_file():
     raise SystemExit(1)
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 contract = json.loads(Path(os.environ["CONTRACT_MANIFEST"]).read_text(encoding="utf-8"))
+if contract.get("source_tree_state") != "clean":
+    raise SystemExit(1)
 expected = {
     "package": "rl-sample-pool",
     "version": os.environ["PACKAGE_VERSION"],
@@ -96,12 +100,6 @@ PY
     exit 1
 fi
 
-if test -n "${source_status}"; then
-    echo "refusing to create a new sample-pool artifact from a dirty worktree" >&2
-    echo "commit the reviewed source first, then rerun this command" >&2
-    exit 1
-fi
-
 mkdir -p "${temp_dir}/bin" "${temp_dir}/config" "$(dirname "${output_dir}")"
 trap 'rm -rf "${temp_dir}"' EXIT
 
@@ -117,17 +115,18 @@ docker run --rm \
     "${builder_image}" \
     bash -lc '
         set -euo pipefail
+        cd /source
+        bash ./test.sh
         cmake -S /source -B /tmp/sample-build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_TESTING=ON \
+            -DBUILD_TESTING=OFF \
             -DCONTRACT_CPP_DIR=/contracts/cpp
         cmake --build /tmp/sample-build --parallel
-        ctest --test-dir /tmp/sample-build --output-on-failure
-        cp /tmp/sample-build/maze_sample_distributor /output/bin/
+        cp /tmp/sample-build/maze_sample_pool /output/bin/
     '
 
-cp "${repo_dir}/configs/distributor_config.yaml" \
-    "${temp_dir}/config/distributor_config.yaml"
+cp "${repo_dir}/configs/pool_config.yaml" \
+    "${temp_dir}/config/pool_config.yaml"
 
 PACKAGE_VERSION="${version}" \
 SOURCE_COMMIT="${source_commit}" \

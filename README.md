@@ -2,7 +2,17 @@
 
 简体中文 | [English](README.en.md)
 
-## 1. 构建 0.11.0 制品
+## 1. 运行测试
+
+在已经挂载 Contracts C++ bindings 的构建容器中执行：
+
+```bash
+bash ./test.sh
+```
+
+`test.sh` 是本仓库唯一公开测试入口；新增或扩写测试必须先有用户批准的 TCR。
+
+## 2. 构建 0.13.0 制品
 
 先生成 Contracts 制品，再从 clean Git 保存点执行：
 
@@ -14,10 +24,10 @@ bash build_artifact.sh
 构建脚本会编译并运行测试。输出：
 
 ```text
-../.workspace/artifacts/rl-sample-pool/0.11.0/<platform>/
+../.workspace/artifacts/rl-sample-pool/0.13.0/<platform>/
 ```
 
-## 2. 装配到 Learner
+## 3. 装配到 Learner
 
 不要手工复制二进制。使用 Learner 同步入口：
 
@@ -25,10 +35,10 @@ bash build_artifact.sh
 (cd ../rl-learner && bash scripts/sync_runtime_artifacts.sh)
 ```
 
-## 3. 单独运行
+## 4. 单独运行
 
 ```bash
-./maze_sample_distributor configs/distributor_config.yaml
+./maze_sample_pool configs/pool_config.yaml
 ```
 
 完整训练由 Learner 容器监管该进程，不需要单独启动。

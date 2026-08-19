@@ -2,7 +2,17 @@
 
 [简体中文](README.md) | English
 
-## 1. Build the 0.11.0 artifact
+## 1. Run tests
+
+Run inside the build container with the Contracts C++ bindings mounted:
+
+```bash
+bash ./test.sh
+```
+
+`test.sh` is the repository's only public test entrypoint. Adding or expanding tests requires a user-approved TCR first.
+
+## 2. Build the 0.13.0 artifact
 
 Create the Contracts artifact first, then run the build from a clean Git savepoint:
 
@@ -14,10 +24,10 @@ bash build_artifact.sh
 The script compiles the service and runs its tests. Output:
 
 ```text
-../.workspace/artifacts/rl-sample-pool/0.11.0/<platform>/
+../.workspace/artifacts/rl-sample-pool/0.13.0/<platform>/
 ```
 
-## 2. Stage it into Learner
+## 3. Stage it into Learner
 
 Do not copy the binary manually. Use the Learner sync entry point:
 
@@ -25,10 +35,10 @@ Do not copy the binary manually. Use the Learner sync entry point:
 (cd ../rl-learner && bash scripts/sync_runtime_artifacts.sh)
 ```
 
-## 3. Run it directly
+## 4. Run it directly
 
 ```bash
-./maze_sample_distributor configs/distributor_config.yaml
+./maze_sample_pool configs/pool_config.yaml
 ```
 
 During full training the Learner container supervises this process; no separate launch is required.

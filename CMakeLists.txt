@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(maze_sample_distributor LANGUAGES CXX)
+project(maze_sample_pool LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,8 +12,9 @@ pkg_check_modules(GRPC REQUIRED grpc++)
 set(SOURCES
     main/main.cpp
     src/config/config_loader.cpp
-    src/grpc/sample_distributor_service.cpp
-    src/store/sample_store.cpp
+    src/grpc/sample_pool_service.cpp
+    src/store/sample_pool_coordinator.cpp
+    src/store/sample_store_backend.cpp
 )
 
 set(CONTRACT_CPP_DIR "" CACHE PATH "Directory containing generated C++ bindings")
@@ -49,7 +50,8 @@ if(BUILD_TESTING)
     add_executable(sample_store_test
         tests/sample_store_test.cpp
         src/config/config_loader.cpp
-        src/store/sample_store.cpp
+        src/store/sample_pool_coordinator.cpp
+        src/store/sample_store_backend.cpp
         ${PROTO_GEN_DIR}/common.pb.cc
         ${PROTO_GEN_DIR}/training.pb.cc
     )
