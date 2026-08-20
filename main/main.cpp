@@ -1,5 +1,5 @@
 #include "config/config_loader.h"
-#include "grpc/sample_distributor_service.h"
+#include "grpc/sample_pool_service.h"
 
 #include <grpcpp/grpcpp.h>
 
@@ -7,11 +7,11 @@
 #include <memory>
 #include <string>
 
-static const char* kDefaultConfigPath = "configs/distributor_config.yaml";
+static const char* kDefaultConfigPath = "configs/pool_config.yaml";
 
 int main(int argc, char* argv[]) {
     std::cout << "============================================\n";
-    std::cout << "  Maze RL - SampleDistributor\n";
+    std::cout << "  RL Training - Local Sample Pool\n";
     std::cout << "============================================\n\n";
 
     const char* config_path = kDefaultConfigPath;
@@ -19,31 +19,40 @@ int main(int argc, char* argv[]) {
         config_path = argv[1];
     }
 
-    DistributorConfig config;
-    LoadDistributorConfig(config_path, config);
+    SamplePoolConfig config;
+    if (!LoadSamplePoolConfig(config_path, config)) {
+        return 2;
+    }
 
-    SampleDistributorServiceImpl service(config);
+    SamplePoolCoordinator coordinator(config);
+    SamplePoolIngressServiceImpl ingress_service(coordinator);
+    SamplePoolConsumerServiceImpl consumer_service(coordinator);
     std::string listen_addr = "0.0.0.0:" + std::to_string(config.listen_port);
 
     grpc::ServerBuilder builder;
     builder.AddListeningPort(listen_addr, grpc::InsecureServerCredentials());
-    builder.RegisterService(&service);
+    builder.RegisterService(&ingress_service);
+    builder.RegisterService(&consumer_service);
 
     std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
     if (!server) {
-        std::cerr << "[SampleDistributor] failed to start: " << listen_addr << std::endl;
+        std::cerr << "[SamplePool] failed to start: " << listen_addr
+                  << std::endl;
         return 1;
     }
 
-    std::cout << "[SampleDistributor] listening on " << listen_addr << std::endl;
-    std::cout << "[SampleDistributor] run_id=" << config.run_id
-              << ", instance_id=" << service.instance_id() << std::endl;
-    std::cout << "[SampleDistributor] max_queue_samples="
-              << config.max_queue_samples
-              << ", max_queue_fragments="
-              << config.max_queue_fragments
-              << ", max_queue_estimated_bytes="
-              << config.max_queue_estimated_bytes
+    std::cout << "[SamplePool] listening on " << listen_addr << std::endl;
+    std::cout << "[SamplePool] backend=" << config.backend_type
+              << ", max_concurrent_consumers=1" << std::endl;
+    std::cout << "[SamplePool] instance_id="
+              << coordinator.instance_id() << std::endl;
+    std::cout << "[SamplePool] capacity_transitions="
+              << config.capacity_transitions
+              << ", capacity_bytes="
+              << config.capacity_bytes
+              << ", sampling=uniform_without_replacement"
+              << ", sampling_seed=" << config.sampling_seed
+              << ", eviction=fifo_ready"
               << ", default_get_timeout_ms="
               << config.default_get_timeout_ms
               << ", default_lease_timeout_ms="
