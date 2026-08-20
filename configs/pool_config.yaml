@@ -1,11 +1,21 @@
 server:
   listen_port: 9100
 
+backend:
+  type: local_memory
+
+storage:
+  capacity_transitions: 10240
+  capacity_bytes: 536870912
+
+sampling:
+  strategy: uniform_without_replacement
+  seed: 0
+
+eviction:
+  strategy: fifo_ready
+
 queue:
-  max_queue_samples: 262144
-  max_queue_fragments: 4096
-  max_fragment_samples: 128  # complete immutable fragment upper bound
-  max_queue_estimated_bytes: 536870912
   max_dedup_entries: 1000000  # bounded terminal UID/digest retry history
   high_watermark_ratio: 0.8
   default_get_timeout_ms: 1000
@@ -16,8 +26,8 @@ queue:
 # identity is missing or differs from the mounted generated bindings.
 contract:
   package_name: rl-contracts
-  package_version: 0.13.0
-  source_digest: 1fc3866efe7e5869cc1a7ed4bc86d58f9c1abedafd7012b9f5dae08246ff145d
-  artifact_digest: 5ce9dff294e3cab466e2e0f058192f9715530645a41b45851b4d798e19a9a5a7
+  package_version: 0.14.0
+  source_digest: 61d633bde1ad4a8dccc2a5e8505d122bbabc8c8cd69eb1cfa97b253c4c2d4c0d
+  artifact_digest: 4642b1a7e18150f9dfc0b7dba6e6ff3b5f0173cb10dee4c432c0155bfa596779
   platform: linux/arm64
   generator_identity: 0eb73fc2cb675bdb34bf3db9c99dae62a82f93a5e3a72db84dcf3936464729c8

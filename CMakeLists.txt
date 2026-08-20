@@ -47,7 +47,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
-    add_executable(sample_store_test
+    add_executable(sample_pool_development_test
         tests/sample_store_test.cpp
         src/config/config_loader.cpp
         src/store/sample_pool_coordinator.cpp
@@ -55,15 +55,18 @@ if(BUILD_TESTING)
         ${PROTO_GEN_DIR}/common.pb.cc
         ${PROTO_GEN_DIR}/training.pb.cc
     )
-    target_include_directories(sample_store_test PRIVATE
+    target_include_directories(sample_pool_development_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${PROTO_GEN_DIR}
         ${Protobuf_INCLUDE_DIRS}
     )
-    target_link_libraries(sample_store_test PRIVATE
+    target_link_libraries(sample_pool_development_test PRIVATE
         protobuf::libprotobuf
         OpenSSL::Crypto
         pthread
     )
-    add_test(NAME sample_store_contract COMMAND sample_store_test)
+    add_test(
+        NAME sample_pool_development_contract
+        COMMAND sample_pool_development_test
+    )
 endif()

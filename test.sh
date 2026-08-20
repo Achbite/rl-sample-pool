@@ -19,13 +19,14 @@ fi
 test_build_dir="$(mktemp -d "${TMPDIR:-/tmp}/rl-sample-pool-test.XXXXXX")"
 trap 'rm -rf "${test_build_dir}"' EXIT
 
-# TCR-A3-TEST-BOUNDARY-001: sample_store_contract is the complete approved
-# suite. New targets or cases require a separately approved TCR.
+# TCR-A3-DEVELOPMENT-VALIDATION-008: this is the only approved SamplePool
+# development-validation case.
 cmake -S "${repo_dir}" -B "${test_build_dir}" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_TESTING=ON \
     -DCONTRACT_CPP_DIR="${contract_cpp_dir}"
-cmake --build "${test_build_dir}" --parallel --target sample_store_test
+cmake --build "${test_build_dir}" --parallel \
+    --target sample_pool_development_test
 ctest --test-dir "${test_build_dir}" \
     --output-on-failure \
-    -R '^sample_store_contract$'
+    -R '^sample_pool_development_contract$'

@@ -4,62 +4,66 @@
 
 #include <cstdint>
 #include <deque>
+#include <random>
 #include <string>
+#include <vector>
 
-struct SampleBatchFingerprint {
+struct EnvelopeFingerprint {
     std::string payload_sha256;
     uint64_t serialized_size = 0;
 
-    bool operator==(const SampleBatchFingerprint& other) const {
+    bool operator==(const EnvelopeFingerprint& other) const {
         return payload_sha256 == other.payload_sha256 &&
                serialized_size == other.serialized_size;
     }
 };
 
-struct StoredFragment {
-    rl::training::v1::SampleBatch batch;
-    SampleBatchFingerprint fingerprint;
-    std::string policy_key;
-    int64_t sample_count = 0;
+struct StoredTransition {
+    rl::training::v1::ProcessedTransition transition;
+    rl::training::v1::TrainingSemanticsIdentity training_semantics;
+    std::string envelope_id;
+    std::string semantics_key;
+    std::string profile_digest_hex;
+    uint64_t insert_sequence = 0;
+    int64_t inserted_at_unix_ms = 0;
     int64_t estimated_bytes = 0;
+    uint32_t draw_count = 0;
 };
 
-// Physical storage is intentionally below ingress validation, delivery leases,
-// deduplication and acknowledgement accounting. A future backend must preserve
-// this interface's FIFO READY order and exact fragment ownership semantics.
+// Storage is below contract validation, envelope deduplication, delivery
+// leases and acknowledgement accounting. A future Reverb backend must expose
+// these transition-level capabilities without changing transport semantics.
 class ISampleStoreBackend {
 public:
     virtual ~ISampleStoreBackend() = default;
 
     virtual const char* name() const = 0;
-    virtual const std::deque<StoredFragment>& ready() const = 0;
-    virtual void PushBack(StoredFragment fragment) = 0;
-    virtual void RestoreFront(std::deque<StoredFragment> fragments) = 0;
-    virtual StoredFragment EvictOldestReady() = 0;
-    virtual std::deque<StoredFragment> ExtractAllReady() = 0;
-    virtual std::deque<StoredFragment> ExtractPolicy(
-        const std::string& policy_key,
-        int64_t minimum_created_at_unix_ms,
-        int64_t target_samples,
-        int64_t max_samples,
-        bool drain_available) = 0;
+    virtual const std::deque<StoredTransition>& ready() const = 0;
+    virtual void PushBack(StoredTransition item) = 0;
+    virtual void RestoreReady(std::vector<StoredTransition> items) = 0;
+    virtual StoredTransition EvictOldestReady() = 0;
+    virtual std::vector<StoredTransition> ExtractAllReady() = 0;
+    virtual std::vector<StoredTransition> DrawUniformWithoutReplacement(
+        size_t count,
+        const std::string& semantics_key,
+        const std::string& profile_digest_hex,
+        std::mt19937_64* generator) = 0;
 };
 
-class LocalFragmentStore final : public ISampleStoreBackend {
+class LocalTransitionStore final : public ISampleStoreBackend {
 public:
     const char* name() const override;
-    const std::deque<StoredFragment>& ready() const override;
-    void PushBack(StoredFragment fragment) override;
-    void RestoreFront(std::deque<StoredFragment> fragments) override;
-    StoredFragment EvictOldestReady() override;
-    std::deque<StoredFragment> ExtractAllReady() override;
-    std::deque<StoredFragment> ExtractPolicy(
-        const std::string& policy_key,
-        int64_t minimum_created_at_unix_ms,
-        int64_t target_samples,
-        int64_t max_samples,
-        bool drain_available) override;
+    const std::deque<StoredTransition>& ready() const override;
+    void PushBack(StoredTransition item) override;
+    void RestoreReady(std::vector<StoredTransition> items) override;
+    StoredTransition EvictOldestReady() override;
+    std::vector<StoredTransition> ExtractAllReady() override;
+    std::vector<StoredTransition> DrawUniformWithoutReplacement(
+        size_t count,
+        const std::string& semantics_key,
+        const std::string& profile_digest_hex,
+        std::mt19937_64* generator) override;
 
 private:
-    std::deque<StoredFragment> ready_;
+    std::deque<StoredTransition> ready_;
 };

@@ -12,6 +12,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <random>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -45,8 +47,8 @@ private:
         std::string consumer_instance_id;
         std::chrono::steady_clock::time_point deadline;
         int64_t deadline_unix_ms = 0;
-        std::deque<StoredFragment> fragments;
-        int64_t sample_count = 0;
+        std::vector<StoredTransition> items;
+        int64_t transition_count = 0;
         int64_t estimated_bytes = 0;
     };
 
@@ -56,38 +58,21 @@ private:
         rl::training::v1::AckDisposition disposition =
             rl::training::v1::ACK_DISPOSITION_UNSPECIFIED;
         std::string train_update_id;
-    };
-
-    struct PolicyCounters {
-        rl::training::v1::BehaviorPolicyReference behavior_policy;
-        int64_t ready_samples = 0;
-        int64_t ready_fragments = 0;
-        int64_t leased_samples = 0;
-        int64_t leased_fragments = 0;
-        int64_t acked_samples = 0;
-        int64_t acked_fragments = 0;
-        int64_t trained_samples = 0;
-        int64_t stale_samples = 0;
-        int64_t invalid_samples = 0;
-        int64_t shutdown_untrained_samples = 0;
-    };
-
-    struct PolicyAvailability {
-        std::string policy_key;
-        int64_t sample_count = 0;
-        size_t first_fifo_index = 0;
+        int64_t affected_transitions = 0;
     };
 
     static int64_t NowMs();
     static std::string CreateInstanceId(const std::string& prefix);
-    static int64_t CountSamples(const rl::training::v1::SampleBatch& batch);
-    static int64_t EstimateBytes(const rl::training::v1::SampleBatch& batch);
+    static int64_t EstimateBytes(
+        const rl::training::v1::ProcessedTransition& transition);
     static std::string DeterministicSerialize(
-        const rl::training::v1::SampleBatch& batch,
+        const rl::training::v1::ProcessedTransitionEnvelope& envelope,
         bool clear_payload_digest);
     static std::string Sha256Hex(const std::string& data);
-    static SampleBatchFingerprint FingerprintBatch(
-        const rl::training::v1::SampleBatch& batch);
+    static EnvelopeFingerprint FingerprintEnvelope(
+        const rl::training::v1::ProcessedTransitionEnvelope& envelope);
+    static std::string FingerprintTransition(
+        const rl::training::v1::ProcessedTransition& transition);
     static bool IsSha256(const rl::common::v1::ContentDigest& digest);
     static bool IsServiceIdentityValid(
         const rl::common::v1::ServiceInstanceIdentity& identity);
@@ -97,8 +82,7 @@ private:
         const rl::training::v1::BehaviorPolicyReference& identity);
     static bool IsSchemaIdentityValid(
         const rl::common::v1::SchemaIdentity& identity);
-    static std::string PolicyKey(
-        const rl::training::v1::BehaviorPolicyReference& policy,
+    static std::string SemanticsKey(
         const rl::training::v1::TrainingSemanticsIdentity& semantics);
 
     bool ContractMatchesConfig(
@@ -106,18 +90,16 @@ private:
     bool ValidateSemantics(
         const rl::training::v1::TrainingSemanticsIdentity& semantics,
         std::string* error) const;
-    bool ValidateBatchLocked(const rl::training::v1::SampleBatch& batch,
-                             std::string* error,
-                             rl::training::v1::PushResult* rejection) const;
+    bool ValidateEnvelopeLocked(
+        const rl::training::v1::ProcessedTransitionEnvelope& envelope,
+        std::string* error,
+        rl::training::v1::PushResult* rejection) const;
     bool DeliveryBelongsToInstanceLocked(const std::string& delivery_id) const;
-    bool CapacityAllowsLocked(int64_t samples,
-                              int64_t fragments,
+    bool CapacityAllowsLocked(int64_t transitions,
                               int64_t estimated_bytes) const;
-    bool CanMakeCapacityLocked(int64_t samples,
-                               int64_t fragments,
+    bool CanMakeCapacityLocked(int64_t transitions,
                                int64_t estimated_bytes) const;
-    void EvictReadyUntilCapacityLocked(int64_t samples,
-                                       int64_t fragments,
+    void EvictReadyUntilCapacityLocked(int64_t transitions,
                                        int64_t estimated_bytes);
     rl::training::v1::PressureState PressureStateLocked() const;
 
@@ -129,9 +111,9 @@ private:
     void RequeueLeaseLocked(bool expired);
     void RememberDeliveryLocked(const std::string& delivery_id,
                                 const DeliveryRecord& record);
-    void RememberCompletedBatchLocked(
-        const std::string& batch_id,
-        const SampleBatchFingerprint& fingerprint);
+    void RememberCompletedEnvelopeLocked(
+        const std::string& envelope_id,
+        const EnvelopeFingerprint& fingerprint);
     const DeliveryRecord* DeliveryHistoryLocked(
         const std::string& delivery_id) const;
     void FillDeliveryResponseLocked(
@@ -139,90 +121,71 @@ private:
     void FillFinalizeResponseLocked(
         rl::training::v1::FinalizeSamplePoolRsp* response) const;
 
-    bool PolicyMatchesFreshnessLocked(
-        const rl::training::v1::BehaviorPolicyReference& policy,
-        const rl::training::v1::SampleFreshnessPolicy& freshness) const;
-    bool FragmentEligibleLocked(
-        const StoredFragment& fragment,
-        const rl::training::v1::SampleFreshnessPolicy& freshness,
-        const rl::training::v1::TrainingSemanticsIdentity& semantics,
-        int64_t minimum_created_at_unix_ms) const;
-    std::vector<PolicyAvailability> EligibleAvailabilityLocked(
-        const rl::training::v1::SampleFreshnessPolicy& freshness,
-        const rl::training::v1::TrainingSemanticsIdentity& semantics,
-        int64_t minimum_created_at_unix_ms) const;
-    std::string OldestEligiblePolicyLocked(
-        const rl::training::v1::SampleFreshnessPolicy& freshness,
-        const rl::training::v1::TrainingSemanticsIdentity& semantics,
-        int64_t minimum_created_at_unix_ms,
-        int64_t minimum_samples) const;
-
     void FillStatusScalarsLocked(
         rl::training::v1::SamplePoolStatusRsp* response) const;
-    static void AppendBehaviorSteps(
-        const std::vector<PolicyCounters>& policy_snapshot,
-        rl::training::v1::SamplePoolStatusRsp* response);
+    int64_t EligibleReadyCountLocked(
+        const std::string& semantics_key,
+        const std::string& profile_digest_hex) const;
+    void RemoveResidentItemLocked(const StoredTransition& item);
 
     SamplePoolConfig config_;
     std::string instance_id_;
     std::unique_ptr<ISampleStoreBackend> backend_;
+    std::mt19937_64 random_;
 
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     bool has_lease_ = false;
     Lease lease_;
 
-    std::unordered_map<std::string, SampleBatchFingerprint>
-        active_batch_fingerprints_;
-    std::unordered_map<std::string, SampleBatchFingerprint>
-        completed_batch_fingerprints_;
-    std::deque<std::string> completed_batch_order_;
+    std::unordered_map<std::string, EnvelopeFingerprint>
+        completed_envelope_fingerprints_;
+    std::deque<std::string> completed_envelope_order_;
+    std::unordered_map<std::string, std::string> seen_item_fingerprints_;
+    std::deque<std::string> seen_item_order_;
+    std::set<std::string> resident_item_ids_;
     std::unordered_map<std::string, DeliveryRecord> delivery_history_;
     std::deque<std::string> delivery_history_order_;
-    std::map<std::string, PolicyCounters> policy_counters_;
-    std::map<std::string, rl::training::v1::BehaviorPolicyReference>
-        behavior_policy_by_key_;
-    std::map<std::string, rl::training::v1::TrainingSemanticsIdentity>
-        training_semantics_by_key_;
+    std::unordered_map<std::string, int64_t> resident_by_envelope_;
+    uint64_t next_insert_sequence_ = 1;
     uint64_t next_delivery_sequence_ = 1;
 
-    int64_t ready_samples_ = 0;
-    int64_t ready_fragments_ = 0;
+    int64_t ready_transitions_ = 0;
     int64_t ready_estimated_bytes_ = 0;
-    int64_t resident_samples_ = 0;
-    int64_t resident_fragments_ = 0;
+    int64_t resident_transitions_ = 0;
     int64_t resident_estimated_bytes_ = 0;
 
     int64_t push_attempt_count_ = 0;
-    int64_t accepted_unique_samples_ = 0;
-    int64_t accepted_unique_batches_ = 0;
+    int64_t accepted_unique_transitions_ = 0;
+    int64_t accepted_unique_envelopes_ = 0;
     int64_t duplicate_push_attempt_count_ = 0;
-    int64_t duplicate_sample_attempts_ = 0;
+    int64_t duplicate_transition_attempts_ = 0;
     int64_t rejected_push_attempt_count_ = 0;
-    int64_t rejected_sample_attempts_ = 0;
-    int64_t acked_unique_samples_ = 0;
-    int64_t acked_unique_batches_ = 0;
-    int64_t trained_sample_count_ = 0;
-    int64_t stale_sample_count_ = 0;
-    int64_t invalid_sample_count_ = 0;
-    int64_t shutdown_untrained_sample_count_ = 0;
+    int64_t rejected_transition_attempts_ = 0;
+    int64_t acked_unique_transitions_ = 0;
+    int64_t acked_unique_deliveries_ = 0;
+    int64_t trained_transition_count_ = 0;
+    int64_t invalid_transition_count_ = 0;
+    int64_t shutdown_untrained_transition_count_ = 0;
     int64_t redelivery_count_ = 0;
     int64_t nack_count_ = 0;
     int64_t expired_lease_count_ = 0;
     int64_t lease_renew_count_ = 0;
     int64_t target_hit_count_ = 0;
-    int64_t partial_get_count_ = 0;
+    int64_t draw_attempt_count_ = 0;
+    int64_t drawn_transition_slot_count_ = 0;
     int64_t empty_timeout_count_ = 0;
     int64_t consumer_busy_count_ = 0;
-    int64_t evicted_sample_count_ = 0;
-    int64_t evicted_fragment_count_ = 0;
+    int64_t evicted_transition_count_ = 0;
+    int64_t evicted_envelope_count_ = 0;
+    int64_t unsampled_evicted_transition_count_ = 0;
+    int64_t previously_drawn_evicted_transition_count_ = 0;
 
     bool finalized_ = false;
     std::string finalization_id_;
     std::string finalization_consumer_key_;
     int64_t finalized_at_unix_ms_ = 0;
-    int64_t finalized_sample_count_ = 0;
-    int64_t finalized_fragment_count_ = 0;
+    int64_t finalized_transition_count_ = 0;
 
     int64_t latest_ack_unix_ms_ = 0;
     std::string last_error_;

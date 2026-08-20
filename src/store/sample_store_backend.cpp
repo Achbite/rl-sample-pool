@@ -1,65 +1,86 @@
 #include "store/sample_store_backend.h"
 
+#include <algorithm>
+#include <numeric>
 #include <stdexcept>
 #include <utility>
 
-const char* LocalFragmentStore::name() const {
-    return "LocalFragmentStore";
+const char* LocalTransitionStore::name() const {
+    return "LocalTransitionStore";
 }
 
-const std::deque<StoredFragment>& LocalFragmentStore::ready() const {
+const std::deque<StoredTransition>& LocalTransitionStore::ready() const {
     return ready_;
 }
 
-void LocalFragmentStore::PushBack(StoredFragment fragment) {
-    ready_.push_back(std::move(fragment));
+void LocalTransitionStore::PushBack(StoredTransition item) {
+    ready_.push_back(std::move(item));
 }
 
-void LocalFragmentStore::RestoreFront(std::deque<StoredFragment> fragments) {
-    while (!fragments.empty()) {
-        ready_.push_front(std::move(fragments.back()));
-        fragments.pop_back();
-    }
+void LocalTransitionStore::RestoreReady(std::vector<StoredTransition> items) {
+    for (auto& item : items) ready_.push_back(std::move(item));
+    std::stable_sort(
+        ready_.begin(), ready_.end(),
+        [](const StoredTransition& left, const StoredTransition& right) {
+            return left.insert_sequence < right.insert_sequence;
+        });
 }
 
-StoredFragment LocalFragmentStore::EvictOldestReady() {
+StoredTransition LocalTransitionStore::EvictOldestReady() {
     if (ready_.empty()) {
-        throw std::logic_error("cannot evict from an empty fragment store");
+        throw std::logic_error("cannot evict from an empty transition store");
     }
-    StoredFragment fragment = std::move(ready_.front());
+    StoredTransition item = std::move(ready_.front());
     ready_.pop_front();
-    return fragment;
+    return item;
 }
 
-std::deque<StoredFragment> LocalFragmentStore::ExtractAllReady() {
-    std::deque<StoredFragment> extracted;
-    extracted.swap(ready_);
+std::vector<StoredTransition> LocalTransitionStore::ExtractAllReady() {
+    std::vector<StoredTransition> extracted;
+    extracted.reserve(ready_.size());
+    while (!ready_.empty()) {
+        extracted.push_back(std::move(ready_.front()));
+        ready_.pop_front();
+    }
     return extracted;
 }
 
-std::deque<StoredFragment> LocalFragmentStore::ExtractPolicy(
-    const std::string& policy_key,
-    int64_t minimum_created_at_unix_ms,
-    int64_t target_samples,
-    int64_t max_samples,
-    bool drain_available) {
-    std::deque<StoredFragment> selected;
-    std::deque<StoredFragment> remaining;
-    int64_t selected_samples = 0;
+std::vector<StoredTransition>
+LocalTransitionStore::DrawUniformWithoutReplacement(
+    size_t count,
+    const std::string& semantics_key,
+    const std::string& profile_digest_hex,
+    std::mt19937_64* generator) {
+    if (generator == nullptr) {
+        throw std::invalid_argument("invalid uniform transition draw");
+    }
 
-    while (!ready_.empty()) {
-        StoredFragment fragment = std::move(ready_.front());
-        ready_.pop_front();
-        const bool still_collecting =
-            drain_available || selected_samples < target_samples;
-        if (still_collecting && fragment.policy_key == policy_key &&
-            fragment.batch.created_at_unix_ms() >=
-                minimum_created_at_unix_ms &&
-            selected_samples + fragment.sample_count <= max_samples) {
-            selected_samples += fragment.sample_count;
-            selected.push_back(std::move(fragment));
+    std::vector<size_t> indices;
+    indices.reserve(ready_.size());
+    for (size_t index = 0; index < ready_.size(); ++index) {
+        if (ready_[index].semantics_key == semantics_key &&
+            ready_[index].profile_digest_hex == profile_digest_hex) {
+            indices.push_back(index);
+        }
+    }
+    if (count > indices.size()) {
+        throw std::invalid_argument("insufficient eligible transitions");
+    }
+    std::shuffle(indices.begin(), indices.end(), *generator);
+    indices.resize(count);
+    std::sort(indices.begin(), indices.end());
+
+    std::vector<StoredTransition> selected;
+    selected.reserve(count);
+    std::deque<StoredTransition> remaining;
+    size_t selected_cursor = 0;
+    for (size_t index = 0; index < ready_.size(); ++index) {
+        if (selected_cursor < indices.size() &&
+            indices[selected_cursor] == index) {
+            selected.push_back(std::move(ready_[index]));
+            ++selected_cursor;
         } else {
-            remaining.push_back(std::move(fragment));
+            remaining.push_back(std::move(ready_[index]));
         }
     }
     ready_ = std::move(remaining);

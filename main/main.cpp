@@ -42,16 +42,17 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "[SamplePool] listening on " << listen_addr << std::endl;
-    std::cout << "[SamplePool] backend=LOCAL_MEMORY"
+    std::cout << "[SamplePool] backend=" << config.backend_type
               << ", max_concurrent_consumers=1" << std::endl;
     std::cout << "[SamplePool] instance_id="
               << coordinator.instance_id() << std::endl;
-    std::cout << "[SamplePool] max_queue_samples="
-              << config.max_queue_samples
-              << ", max_queue_fragments="
-              << config.max_queue_fragments
-              << ", max_queue_estimated_bytes="
-              << config.max_queue_estimated_bytes
+    std::cout << "[SamplePool] capacity_transitions="
+              << config.capacity_transitions
+              << ", capacity_bytes="
+              << config.capacity_bytes
+              << ", sampling=uniform_without_replacement"
+              << ", sampling_seed=" << config.sampling_seed
+              << ", eviction=fifo_ready"
               << ", default_get_timeout_ms="
               << config.default_get_timeout_ms
               << ", default_lease_timeout_ms="

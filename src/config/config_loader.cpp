@@ -1,6 +1,7 @@
 #include "config/config_loader.h"
 
 #include <cstdlib>
+#include <cmath>
 #include <fstream>
 #include <iostream>
 #include <set>
@@ -126,10 +127,12 @@ bool IsLowerSha256(const std::string& value) {
 bool IsAllowedEntry(const YamlEntry& entry) {
     static const std::set<std::string> allowed = {
         "server.listen_port",
-        "queue.max_queue_samples",
-        "queue.max_queue_fragments",
-        "queue.max_fragment_samples",
-        "queue.max_queue_estimated_bytes",
+        "backend.type",
+        "storage.capacity_transitions",
+        "storage.capacity_bytes",
+        "sampling.seed",
+        "sampling.strategy",
+        "eviction.strategy",
         "queue.max_dedup_entries",
         "queue.high_watermark_ratio",
         "queue.default_get_timeout_ms",
@@ -184,12 +187,15 @@ bool LoadSamplePoolConfig(const std::string& yaml_path,
 
     SamplePoolConfig parsed;
     const std::string* listen_port = required("server", "listen_port");
-    const std::string* max_samples = required("queue", "max_queue_samples");
-    const std::string* max_fragments = required("queue", "max_queue_fragments");
-    const std::string* max_fragment_samples =
-        required("queue", "max_fragment_samples");
-    const std::string* max_bytes =
-        required("queue", "max_queue_estimated_bytes");
+    const std::string* backend_type = required("backend", "type");
+    const std::string* capacity_transitions =
+        required("storage", "capacity_transitions");
+    const std::string* capacity_bytes = required("storage", "capacity_bytes");
+    const std::string* sampling_seed = required("sampling", "seed");
+    const std::string* sampling_strategy =
+        required("sampling", "strategy");
+    const std::string* eviction_strategy =
+        required("eviction", "strategy");
     const std::string* max_dedup = required("queue", "max_dedup_entries");
     const std::string* high_watermark =
         required("queue", "high_watermark_ratio");
@@ -208,18 +214,18 @@ bool LoadSamplePoolConfig(const std::string& yaml_path,
     const std::string* platform = required("contract", "platform");
     const std::string* generator =
         required("contract", "generator_identity");
-    if (!listen_port || !max_samples || !max_fragments ||
-        !max_fragment_samples || !max_bytes ||
+    if (!listen_port || !backend_type || !capacity_transitions ||
+        !capacity_bytes || !sampling_seed || !sampling_strategy ||
+        !eviction_strategy ||
         !max_dedup || !high_watermark || !get_timeout || !lease_timeout ||
         !delivery_history || !package_name || !package_version ||
         !source_digest || !artifact_digest || !platform || !generator) {
         return false;
     }
     if (!ParseInteger(*listen_port, &parsed.listen_port) ||
-        !ParseInteger(*max_samples, &parsed.max_queue_samples) ||
-        !ParseInteger(*max_fragments, &parsed.max_queue_fragments) ||
-        !ParseInteger(*max_fragment_samples, &parsed.max_fragment_samples) ||
-        !ParseInteger(*max_bytes, &parsed.max_queue_estimated_bytes) ||
+        !ParseInteger(*capacity_transitions, &parsed.capacity_transitions) ||
+        !ParseInteger(*capacity_bytes, &parsed.capacity_bytes) ||
+        !ParseInteger(*sampling_seed, &parsed.sampling_seed) ||
         !ParseInteger(*max_dedup, &parsed.max_dedup_entries) ||
         !ParseDouble(*high_watermark, &parsed.high_watermark_ratio) ||
         !ParseInteger(*get_timeout, &parsed.default_get_timeout_ms) ||
@@ -229,6 +235,7 @@ bool LoadSamplePoolConfig(const std::string& yaml_path,
                   << std::endl;
         return false;
     }
+    parsed.backend_type = *backend_type;
     parsed.contract.package_name = *package_name;
     parsed.contract.package_version = *package_version;
     parsed.contract.source_digest = *source_digest;
@@ -236,17 +243,19 @@ bool LoadSamplePoolConfig(const std::string& yaml_path,
     parsed.contract.platform = *platform;
     parsed.contract.generator_identity = *generator;
     if (parsed.listen_port <= 0 || parsed.listen_port > 65535 ||
-        parsed.max_queue_samples <= 0 || parsed.max_queue_fragments <= 0 ||
-        parsed.max_fragment_samples <= 0 ||
-        parsed.max_queue_estimated_bytes <= 0 ||
+        parsed.backend_type != "local_memory" ||
+        parsed.capacity_transitions <= 0 || parsed.capacity_bytes <= 0 ||
+        *sampling_strategy != "uniform_without_replacement" ||
+        *eviction_strategy != "fifo_ready" ||
         parsed.max_dedup_entries <= 0 ||
         parsed.high_watermark_ratio <= 0.0 ||
         parsed.high_watermark_ratio >= 1.0 ||
+        !std::isfinite(parsed.high_watermark_ratio) ||
         parsed.default_get_timeout_ms <= 0 ||
         parsed.default_lease_timeout_ms <= 0 ||
         parsed.delivery_history_size <= 0 ||
         parsed.contract.package_name != "rl-contracts" ||
-        parsed.contract.package_version != "0.13.0" ||
+        parsed.contract.package_version != "0.14.0" ||
         !IsLowerSha256(parsed.contract.source_digest) ||
         !IsLowerSha256(parsed.contract.artifact_digest) ||
         parsed.contract.platform.empty() ||
@@ -256,17 +265,48 @@ bool LoadSamplePoolConfig(const std::string& yaml_path,
         return false;
     }
 
-    // The port is deployment wiring, not a training semantic. It is the only
-    // supported runtime override in the local container launcher.
+    // Deployment wiring and bounded local-store controls may be overridden by
+    // the component launcher. Backend and sampling semantics remain explicit
+    // config facts; unsupported values fail instead of selecting a fallback.
     if (const char* port = std::getenv("RL_SAMPLE_POOL_PORT")) {
         int override_port = 0;
-        if (!ParseInteger(std::string(port), &override_port) ||
+        if (*port == '\0' ||
+            !ParseInteger(std::string(port), &override_port) ||
             override_port <= 0 || override_port > 65535) {
             std::cerr << "[SamplePool] RL_SAMPLE_POOL_PORT is invalid"
                       << std::endl;
             return false;
         }
         parsed.listen_port = override_port;
+    }
+    if (const char* capacity =
+            std::getenv("RL_SAMPLE_POOL_CAPACITY_TRANSITIONS")) {
+        if (*capacity == '\0' ||
+            !ParseInteger(std::string(capacity),
+                          &parsed.capacity_transitions) ||
+            parsed.capacity_transitions <= 0) {
+            std::cerr
+                << "[SamplePool] RL_SAMPLE_POOL_CAPACITY_TRANSITIONS is invalid"
+                << std::endl;
+            return false;
+        }
+    }
+    if (const char* capacity = std::getenv("RL_SAMPLE_POOL_CAPACITY_BYTES")) {
+        if (*capacity == '\0' ||
+            !ParseInteger(std::string(capacity), &parsed.capacity_bytes) ||
+            parsed.capacity_bytes <= 0) {
+            std::cerr << "[SamplePool] RL_SAMPLE_POOL_CAPACITY_BYTES is invalid"
+                      << std::endl;
+            return false;
+        }
+    }
+    if (const char* seed = std::getenv("RL_SAMPLE_POOL_SAMPLING_SEED")) {
+        if (*seed == '\0' ||
+            !ParseInteger(std::string(seed), &parsed.sampling_seed)) {
+            std::cerr << "[SamplePool] RL_SAMPLE_POOL_SAMPLING_SEED is invalid"
+                      << std::endl;
+            return false;
+        }
     }
     output = parsed;
     return true;

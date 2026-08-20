@@ -1,25 +1,46 @@
 #include "store/sample_pool_coordinator.h"
 
-#include <algorithm>
-#include <cmath>
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
+#include <openssl/sha.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <iomanip>
+#include <iostream>
 #include <limits>
-#include <openssl/evp.h>
-#include <random>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
 
 namespace {
 
-constexpr char kAIServerSampleProducerComponent[] = "aiserver";
+template <typename Message>
+std::string DeterministicBytes(const Message& message) {
+    std::string output;
+    output.reserve(static_cast<size_t>(message.ByteSizeLong()));
+    google::protobuf::io::StringOutputStream stream(&output);
+    google::protobuf::io::CodedOutputStream coded(&stream);
+    coded.SetSerializationDeterministic(true);
+    if (!message.SerializeToCodedStream(&coded) || coded.HadError()) {
+        throw std::runtime_error("deterministic protobuf serialization failed");
+    }
+    return output;
+}
 
-bool FiniteRepeated(const google::protobuf::RepeatedField<float>& values) {
-    return std::all_of(values.begin(), values.end(), [](float value) {
-        return std::isfinite(value);
-    });
+bool Finite(float value) {
+    return std::isfinite(static_cast<double>(value));
+}
+
+bool Finite(double value) {
+    return std::isfinite(value);
+}
+
+bool SameDigest(const rl::common::v1::ContentDigest& left,
+                const rl::common::v1::ContentDigest& right) {
+    return left.algorithm() == right.algorithm() && left.hex() == right.hex();
 }
 
 }  // namespace
@@ -27,79 +48,64 @@ bool FiniteRepeated(const google::protobuf::RepeatedField<float>& values) {
 SamplePoolCoordinator::SamplePoolCoordinator(const SamplePoolConfig& config)
     : config_(config),
       instance_id_(CreateInstanceId("sample-pool")),
-      backend_(std::make_unique<LocalFragmentStore>()) {}
+      backend_(std::make_unique<LocalTransitionStore>()),
+      random_(config.sampling_seed) {}
 
 int64_t SamplePoolCoordinator::NowMs() {
-    const auto now = std::chrono::system_clock::now();
     return std::chrono::duration_cast<std::chrono::milliseconds>(
-               now.time_since_epoch())
+               std::chrono::system_clock::now().time_since_epoch())
         .count();
 }
 
 std::string SamplePoolCoordinator::CreateInstanceId(
     const std::string& prefix) {
-    std::random_device random_device;
-    std::mt19937_64 random(random_device());
+    const auto now = std::chrono::high_resolution_clock::now()
+                         .time_since_epoch()
+                         .count();
     std::ostringstream output;
-    output << prefix << "-" << NowMs() << "-" << std::hex << std::setw(16)
-           << std::setfill('0') << random();
+    output << prefix << "-" << now << "-" << std::hex
+           << std::hash<std::string>{}(prefix + std::to_string(now));
     return output.str();
-}
-
-int64_t SamplePoolCoordinator::CountSamples(
-    const rl::training::v1::SampleBatch& batch) {
-    return static_cast<int64_t>(batch.samples_size());
 }
 
 int64_t SamplePoolCoordinator::EstimateBytes(
-    const rl::training::v1::SampleBatch& batch) {
-    return static_cast<int64_t>(batch.ByteSizeLong());
+    const rl::training::v1::ProcessedTransition& transition) {
+    const auto bytes = transition.ByteSizeLong();
+    if (bytes > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+        throw std::overflow_error("processed transition size exceeds int64");
+    }
+    return static_cast<int64_t>(bytes);
 }
 
 std::string SamplePoolCoordinator::DeterministicSerialize(
-    const rl::training::v1::SampleBatch& batch,
+    const rl::training::v1::ProcessedTransitionEnvelope& envelope,
     bool clear_payload_digest) {
-    rl::training::v1::SampleBatch copy(batch);
+    rl::training::v1::ProcessedTransitionEnvelope copy(envelope);
     if (clear_payload_digest) copy.clear_payload_digest();
-    std::string serialized;
-    google::protobuf::io::StringOutputStream output(&serialized);
-    google::protobuf::io::CodedOutputStream coded(&output);
-    coded.SetSerializationDeterministic(true);
-    if (!copy.SerializeToCodedStream(&coded) || coded.HadError()) {
-        throw std::runtime_error("failed to serialize SampleBatch");
-    }
-    coded.Trim();
-    return serialized;
+    return DeterministicBytes(copy);
 }
 
 std::string SamplePoolCoordinator::Sha256Hex(const std::string& data) {
-    EVP_MD_CTX* context = EVP_MD_CTX_new();
-    if (context == nullptr) {
-        throw std::runtime_error("EVP_MD_CTX_new failed");
-    }
-    unsigned char digest[EVP_MAX_MD_SIZE];
-    unsigned int digest_size = 0;
-    const bool ok = EVP_DigestInit_ex(context, EVP_sha256(), nullptr) == 1 &&
-                    EVP_DigestUpdate(context, data.data(), data.size()) == 1 &&
-                    EVP_DigestFinal_ex(context, digest, &digest_size) == 1;
-    EVP_MD_CTX_free(context);
-    if (!ok || digest_size != 32) {
-        throw std::runtime_error("SHA-256 calculation failed");
-    }
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(data.data()),
+           data.size(), digest);
     std::ostringstream output;
     output << std::hex << std::setfill('0');
-    for (unsigned int index = 0; index < digest_size; ++index) {
-        output << std::setw(2) << static_cast<unsigned int>(digest[index]);
+    for (unsigned char byte : digest) {
+        output << std::setw(2) << static_cast<int>(byte);
     }
     return output.str();
 }
 
-SampleBatchFingerprint SamplePoolCoordinator::FingerprintBatch(
-    const rl::training::v1::SampleBatch& batch) {
-    return SampleBatchFingerprint{
-        batch.payload_digest().hex(),
-        static_cast<uint64_t>(DeterministicSerialize(batch, false).size()),
-    };
+EnvelopeFingerprint SamplePoolCoordinator::FingerprintEnvelope(
+    const rl::training::v1::ProcessedTransitionEnvelope& envelope) {
+    const std::string bytes = DeterministicSerialize(envelope, true);
+    return {Sha256Hex(bytes), static_cast<uint64_t>(bytes.size())};
+}
+
+std::string SamplePoolCoordinator::FingerprintTransition(
+    const rl::training::v1::ProcessedTransition& transition) {
+    return Sha256Hex(DeterministicBytes(transition));
 }
 
 bool SamplePoolCoordinator::IsSha256(
@@ -108,9 +114,8 @@ bool SamplePoolCoordinator::IsSha256(
         digest.hex().size() != 64) {
         return false;
     }
-    return std::all_of(digest.hex().begin(), digest.hex().end(), [](char value) {
-        return (value >= '0' && value <= '9') ||
-               (value >= 'a' && value <= 'f');
+    return std::all_of(digest.hex().begin(), digest.hex().end(), [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
     });
 }
 
@@ -122,7 +127,7 @@ bool SamplePoolCoordinator::IsServiceIdentityValid(
 
 std::string SamplePoolCoordinator::ServiceKey(
     const rl::common::v1::ServiceInstanceIdentity& identity) {
-    return identity.component() + "\x1f" + identity.instance_id() + "\x1f" +
+    return identity.component() + "|" + identity.instance_id() + "|" +
            std::to_string(identity.lifecycle_epoch());
 }
 
@@ -130,7 +135,9 @@ bool SamplePoolCoordinator::IsBehaviorPolicyReferenceValid(
     const rl::training::v1::BehaviorPolicyReference& identity) {
     return !identity.model_lineage_id().empty() && identity.has_model_step() &&
            !identity.distribution_schema_id().empty() &&
-           IsSha256(identity.policy_spec_digest());
+           IsSha256(identity.policy_spec_digest()) &&
+           IsSha256(identity.artifact_digest()) &&
+           IsSha256(identity.manifest_digest());
 }
 
 bool SamplePoolCoordinator::IsSchemaIdentityValid(
@@ -139,14 +146,9 @@ bool SamplePoolCoordinator::IsSchemaIdentityValid(
            IsSha256(identity.canonical_digest());
 }
 
-std::string SamplePoolCoordinator::PolicyKey(
-    const rl::training::v1::BehaviorPolicyReference& policy,
+std::string SamplePoolCoordinator::SemanticsKey(
     const rl::training::v1::TrainingSemanticsIdentity& semantics) {
-    return policy.model_lineage_id() + "\x1f" +
-           std::to_string(policy.model_step()) + "\x1f" +
-           policy.distribution_schema_id() + "\x1f" +
-           policy.policy_spec_digest().hex() + "\x1f" +
-           semantics.semantics_digest().hex();
+    return Sha256Hex(DeterministicBytes(semantics));
 }
 
 bool SamplePoolCoordinator::ContractMatchesConfig(
@@ -179,219 +181,280 @@ bool SamplePoolCoordinator::ValidateSemantics(
     return true;
 }
 
-bool SamplePoolCoordinator::ValidateBatchLocked(
-    const rl::training::v1::SampleBatch& batch,
+bool SamplePoolCoordinator::ValidateEnvelopeLocked(
+    const rl::training::v1::ProcessedTransitionEnvelope& envelope,
     std::string* error,
     rl::training::v1::PushResult* rejection) const {
     *rejection = rl::training::v1::PUSH_RESULT_REJECTED_INVALID;
-    if (batch.batch_id().empty() || batch.actor_session_id().empty() ||
-        batch.trajectory_id().empty() || batch.created_at_unix_ms() <= 0) {
-        *error = "batch identity is incomplete";
+    if (envelope.envelope_id().empty() || envelope.transitions_size() <= 0) {
+        *error = "envelope identity or transitions are missing";
         return false;
     }
-    if (!IsServiceIdentityValid(batch.producer()) ||
-        batch.producer().component() != kAIServerSampleProducerComponent) {
-        *error = "producer must be an aiserver service identity";
+    if (!ContractMatchesConfig(envelope.contract())) {
+        *rejection = rl::training::v1::PUSH_RESULT_REJECTED_IDENTITY;
+        *error = "contract identity does not match SamplePool";
+        return false;
+    }
+    if (!IsServiceIdentityValid(envelope.producer()) ||
+        envelope.producer().component() != "sample-distributor") {
+        *rejection = rl::training::v1::PUSH_RESULT_REJECTED_IDENTITY;
+        *error = "producer must be a concrete sample-distributor instance";
+        return false;
+    }
+    if (!ValidateSemantics(envelope.training_semantics(), error)) {
         *rejection = rl::training::v1::PUSH_RESULT_REJECTED_IDENTITY;
         return false;
     }
-    if (!ContractMatchesConfig(batch.contract())) {
-        *error = "contract identity does not match the configured artifact";
-        *rejection = rl::training::v1::PUSH_RESULT_REJECTED_IDENTITY;
+    if (envelope.created_at_unix_ms() <= 0 ||
+        !IsSha256(envelope.payload_digest())) {
+        *error = "envelope timestamp or digest is invalid";
         return false;
     }
-    if (!IsBehaviorPolicyReferenceValid(batch.behavior_policy())) {
-        *error = "behavior policy reference is invalid";
-        *rejection = rl::training::v1::PUSH_RESULT_REJECTED_IDENTITY;
-        return false;
-    }
-    if (!ValidateSemantics(batch.training_semantics(), error)) {
-        *rejection = rl::training::v1::PUSH_RESULT_REJECTED_IDENTITY;
-        return false;
-    }
-    if (batch.behavior_policy().distribution_schema_id() !=
-        batch.training_semantics().policy_distribution_schema_id()) {
-        *error = "behavior policy and training semantics disagree";
-        *rejection = rl::training::v1::PUSH_RESULT_REJECTED_IDENTITY;
-        return false;
-    }
-    if (!IsSha256(batch.payload_digest())) {
-        *error = "payload digest is not a canonical SHA-256 value";
-        return false;
-    }
+
+    EnvelopeFingerprint fingerprint;
     try {
-        if (Sha256Hex(DeterministicSerialize(batch, true)) !=
-            batch.payload_digest().hex()) {
-            *error = "payload digest does not match deterministic bytes";
-            return false;
-        }
+        fingerprint = FingerprintEnvelope(envelope);
     } catch (const std::exception& exception) {
         *error = exception.what();
         return false;
     }
-    if (batch.samples_size() == 0) {
-        *error = "empty fragment is invalid";
-        return false;
-    }
-    if (batch.samples_size() > config_.max_fragment_samples) {
-        *error = "fragment exceeds max_fragment_samples";
-        return false;
-    }
-    if (batch.last_action_step() < batch.first_action_step() ||
-        batch.last_action_step() - batch.first_action_step() + 1 !=
-            static_cast<uint64_t>(batch.samples_size())) {
-        *error = "fragment action-step range does not match sample count";
+    if (fingerprint.payload_sha256 != envelope.payload_digest().hex()) {
+        *rejection = rl::training::v1::PUSH_RESULT_REJECTED_CONFLICT;
+        *error = "envelope payload digest mismatch";
         return false;
     }
 
-    for (int index = 0; index < batch.samples_size(); ++index) {
-        const auto& sample = batch.samples(index);
-        const uint64_t expected_step = batch.first_action_step() + index;
-        if (sample.action_step() != expected_step) {
-            *error = "sample action_step is not contiguous";
+    std::set<std::string> item_ids;
+    const auto& first = envelope.transitions(0);
+    for (int index = 0; index < envelope.transitions_size(); ++index) {
+        const auto& item = envelope.transitions(index);
+        if (item.item_id().empty() || item.environment_session_id().empty() ||
+            item.episode_id().empty() || item.segment_id().empty() ||
+            item.segment_transition_count() == 0 ||
+            item.transition_index() >= item.segment_transition_count() ||
+            item.observation_size() <= 0 ||
+            item.next_observation_size() != item.observation_size() ||
+            item.created_at_unix_ms() <= 0 ||
+            item.end_kind() ==
+                rl::training::v1::TRANSITION_END_KIND_UNSPECIFIED ||
+            !IsBehaviorPolicyReferenceValid(item.behavior_policy()) ||
+            !IsSha256(item.rollout_estimator_profile_digest())) {
+            *error = "processed transition identity or provenance is incomplete";
             return false;
         }
-        if (sample.observation_size() == 0 ||
-            sample.observation_size() != sample.next_observation_size() ||
-            !FiniteRepeated(sample.observation()) ||
-            !FiniteRepeated(sample.next_observation()) || sample.action() < 0 ||
-            !std::isfinite(sample.reward()) ||
-            !std::isfinite(sample.old_log_probability()) ||
-            !std::isfinite(sample.old_value_prediction()) ||
-            (sample.terminated() && sample.truncated())) {
-            *error = "sample payload is invalid";
+        if (!item_ids.insert(item.item_id()).second) {
+            *error = "envelope contains duplicate item identity";
             return false;
         }
-        switch (sample.end_kind()) {
-            case rl::training::v1::TRANSITION_END_KIND_CONTINUING:
-                if (sample.terminated() || sample.truncated()) {
-                    *error = "continuing transition carries an end flag";
-                    return false;
-                }
-                break;
-            case rl::training::v1::TRANSITION_END_KIND_ENVIRONMENT_TERMINATED:
-                if (!sample.terminated() || sample.truncated()) {
-                    *error = "terminated transition flags are inconsistent";
-                    return false;
-                }
-                break;
-            case rl::training::v1::TRANSITION_END_KIND_EXTERNAL_TRUNCATION:
-                if (sample.terminated() || !sample.truncated()) {
-                    *error = "truncated transition flags are inconsistent";
-                    return false;
-                }
-                break;
-            case rl::training::v1::TRANSITION_END_KIND_PRODUCER_ABORT:
-                *error = "producer-aborted fragments cannot enter training";
+        for (float value : item.observation()) {
+            if (!Finite(value)) {
+                *error = "processed transition observation is non-finite";
                 return false;
-            default:
-                *error = "transition end kind is unspecified";
-                return false;
+            }
         }
-        if (index + 1 < batch.samples_size() &&
-            (sample.terminated() || sample.truncated())) {
-            *error = "only the final sample may end a fragment";
+        for (float value : item.next_observation()) {
+            if (!Finite(value)) {
+                *error = "processed transition next observation is non-finite";
+                return false;
+            }
+        }
+        if (!Finite(item.reward()) ||
+            !Finite(item.behavior_log_probability()) ||
+            !Finite(item.behavior_value()) || !Finite(item.advantage()) ||
+            !Finite(item.value_target())) {
+            *error = "processed transition scalar is non-finite";
             return false;
         }
-    }
 
-    const auto& final_sample = batch.samples(batch.samples_size() - 1);
-    const bool final_ends = final_sample.terminated() ||
-                            final_sample.truncated();
-    if (batch.trajectory_end() != final_ends) {
-        *error = "trajectory_end does not match the final transition";
-        return false;
-    }
-    if (final_sample.terminated()) {
-        if (batch.bootstrap_valid() ||
-            std::fabs(batch.bootstrap_value()) > 1e-6f) {
-            *error = "terminated fragment must not bootstrap";
+        const bool final_transition =
+            item.transition_index() + 1 == item.segment_transition_count();
+        if (item.segment_boundary() != final_transition) {
+            *error = "segment boundary does not match transition index";
             return false;
         }
-    } else if (!batch.bootstrap_valid() ||
-               !std::isfinite(batch.bootstrap_value())) {
-        *error = "continuing or truncated fragment requires finite bootstrap";
-        return false;
+        const bool terminal_close =
+            item.segment_close_reason() ==
+                rl::training::v1::SEGMENT_CLOSE_REASON_GOAL ||
+            item.segment_close_reason() ==
+                rl::training::v1::SEGMENT_CLOSE_REASON_TIME_LIMIT;
+        const bool tmax_close =
+            item.segment_close_reason() ==
+            rl::training::v1::SEGMENT_CLOSE_REASON_TMAX;
+        const bool producer_abort_close =
+            item.segment_close_reason() ==
+                rl::training::v1::
+                    SEGMENT_CLOSE_REASON_CLIENT_CONTROLLED_CLOSE ||
+            item.segment_close_reason() ==
+                rl::training::v1::
+                    SEGMENT_CLOSE_REASON_CLIENT_RECOVERY_TIMEOUT ||
+            item.segment_close_reason() ==
+                rl::training::v1::
+                    SEGMENT_CLOSE_REASON_AISERVER_CONTROLLED_SHUTDOWN;
+        const bool valid_close_reason =
+            terminal_close || tmax_close || producer_abort_close;
+        if (final_transition && !valid_close_reason) {
+            *error = "segment boundary requires a valid close reason";
+            return false;
+        }
+        if (!final_transition &&
+            item.segment_close_reason() !=
+                rl::training::v1::SEGMENT_CLOSE_REASON_UNSPECIFIED) {
+            *error = "non-boundary transition carries a close reason";
+            return false;
+        }
+        if (item.environment_terminal() !=
+            (terminal_close && final_transition)) {
+            *error = "environment terminal fact conflicts with close reason";
+            return false;
+        }
+        if (final_transition) {
+            if (!item.has_bootstrap_value() ||
+                !Finite(item.bootstrap_value())) {
+                *error = "segment boundary requires a finite bootstrap fact";
+                return false;
+            }
+            if (terminal_close &&
+                (item.bootstrap_applied() || item.bootstrap_value() != 0.0f)) {
+                *error = "terminal transition must use zero bootstrap";
+                return false;
+            }
+            if (!terminal_close && !item.bootstrap_applied()) {
+                *error = "non-terminal segment boundary requires bootstrap";
+                return false;
+            }
+        } else {
+            if (item.has_bootstrap_value() || item.bootstrap_applied()) {
+                *error = "bootstrap may only be attached to segment boundary";
+                return false;
+            }
+        }
+
+        const auto expected_end_kind =
+            !final_transition
+                ? rl::training::v1::TRANSITION_END_KIND_CONTINUING
+                : terminal_close
+                      ? rl::training::v1::
+                            TRANSITION_END_KIND_ENVIRONMENT_TERMINATED
+                : tmax_close
+                            ? rl::training::v1::
+                                  TRANSITION_END_KIND_EXTERNAL_TRUNCATION
+                            : rl::training::v1::
+                                  TRANSITION_END_KIND_PRODUCER_ABORT;
+        if (item.end_kind() != expected_end_kind) {
+            *error = "transition end kind conflicts with segment close facts";
+            return false;
+        }
+
+        if (item.environment_session_id() !=
+                first.environment_session_id() ||
+            item.episode_id() != first.episode_id() ||
+            item.agent_id() != first.agent_id() ||
+            item.segment_id() != first.segment_id() ||
+            item.segment_transition_count() !=
+                first.segment_transition_count() ||
+            DeterministicBytes(item.behavior_policy()) !=
+                DeterministicBytes(first.behavior_policy()) ||
+            !SameDigest(item.rollout_estimator_profile_digest(),
+                        first.rollout_estimator_profile_digest())) {
+            *error = "transport envelope mixes segment or policy identity";
+            return false;
+        }
+        if (index > 0 &&
+            item.transition_index() !=
+                envelope.transitions(index - 1).transition_index() + 1) {
+            *error = "transport envelope transition indexes are not contiguous";
+            return false;
+        }
     }
     return true;
 }
 
 bool SamplePoolCoordinator::DeliveryBelongsToInstanceLocked(
     const std::string& delivery_id) const {
-    return delivery_id.rfind(instance_id_ + "-delivery-", 0) == 0;
+    const std::string prefix = instance_id_ + "/delivery-";
+    return delivery_id.rfind(prefix, 0) == 0;
 }
 
 bool SamplePoolCoordinator::CapacityAllowsLocked(
-    int64_t samples,
-    int64_t fragments,
+    int64_t transitions,
     int64_t estimated_bytes) const {
-    return resident_samples_ + samples <= config_.max_queue_samples &&
-           resident_fragments_ + fragments <= config_.max_queue_fragments &&
-           resident_estimated_bytes_ + estimated_bytes <=
-               config_.max_queue_estimated_bytes;
+    return transitions >= 0 && estimated_bytes >= 0 &&
+           resident_transitions_ <=
+               config_.capacity_transitions - transitions &&
+           resident_estimated_bytes_ <=
+               config_.capacity_bytes - estimated_bytes;
 }
 
 bool SamplePoolCoordinator::CanMakeCapacityLocked(
-    int64_t samples,
-    int64_t fragments,
+    int64_t transitions,
     int64_t estimated_bytes) const {
-    if (samples > config_.max_queue_samples ||
-        fragments > config_.max_queue_fragments ||
-        estimated_bytes > config_.max_queue_estimated_bytes) {
+    if (transitions > config_.capacity_transitions ||
+        estimated_bytes > config_.capacity_bytes) {
         return false;
     }
-    const int64_t protected_samples = resident_samples_ - ready_samples_;
-    const int64_t protected_fragments = resident_fragments_ - ready_fragments_;
-    const int64_t protected_bytes =
-        resident_estimated_bytes_ - ready_estimated_bytes_;
-    return protected_samples + samples <= config_.max_queue_samples &&
-           protected_fragments + fragments <= config_.max_queue_fragments &&
-           protected_bytes + estimated_bytes <=
-               config_.max_queue_estimated_bytes;
+    return resident_transitions_ - ready_transitions_ <=
+               config_.capacity_transitions - transitions &&
+           resident_estimated_bytes_ - ready_estimated_bytes_ <=
+               config_.capacity_bytes - estimated_bytes;
+}
+
+void SamplePoolCoordinator::RemoveResidentItemLocked(
+    const StoredTransition& item) {
+    --resident_transitions_;
+    resident_estimated_bytes_ -= item.estimated_bytes;
+    resident_item_ids_.erase(item.transition.item_id());
+    auto envelope = resident_by_envelope_.find(item.envelope_id);
+    if (envelope != resident_by_envelope_.end()) {
+        --envelope->second;
+        if (envelope->second == 0) resident_by_envelope_.erase(envelope);
+    }
 }
 
 void SamplePoolCoordinator::EvictReadyUntilCapacityLocked(
-    int64_t samples,
-    int64_t fragments,
+    int64_t transitions,
     int64_t estimated_bytes) {
-    while (!CapacityAllowsLocked(samples, fragments, estimated_bytes)) {
-        StoredFragment evicted = backend_->EvictOldestReady();
-        ready_samples_ -= evicted.sample_count;
-        --ready_fragments_;
-        ready_estimated_bytes_ -= evicted.estimated_bytes;
-        resident_samples_ -= evicted.sample_count;
-        --resident_fragments_;
-        resident_estimated_bytes_ -= evicted.estimated_bytes;
-        evicted_sample_count_ += evicted.sample_count;
-        ++evicted_fragment_count_;
-
-        auto& counters = policy_counters_[evicted.policy_key];
-        counters.ready_samples -= evicted.sample_count;
-        --counters.ready_fragments;
-        const auto active =
-            active_batch_fingerprints_.find(evicted.batch.batch_id());
-        if (active != active_batch_fingerprints_.end()) {
-            RememberCompletedBatchLocked(evicted.batch.batch_id(),
-                                         active->second);
-            active_batch_fingerprints_.erase(active);
+    while (!CapacityAllowsLocked(transitions, estimated_bytes)) {
+        StoredTransition item = backend_->EvictOldestReady();
+        --ready_transitions_;
+        ready_estimated_bytes_ -= item.estimated_bytes;
+        const bool envelope_will_be_empty =
+            resident_by_envelope_.count(item.envelope_id) == 1 &&
+            resident_by_envelope_.at(item.envelope_id) == 1;
+        RemoveResidentItemLocked(item);
+        ++evicted_transition_count_;
+        if (item.draw_count == 0) {
+            ++unsampled_evicted_transition_count_;
+        } else {
+            ++previously_drawn_evicted_transition_count_;
         }
+        if (envelope_will_be_empty) ++evicted_envelope_count_;
+        std::cout << "[SamplePool][Eviction] item_id="
+                  << item.transition.item_id()
+                  << " insert_sequence=" << item.insert_sequence
+                  << " inserted_at_unix_ms=" << item.inserted_at_unix_ms
+                  << " resident_age_ms=" << (NowMs() - item.inserted_at_unix_ms)
+                  << " draw_count=" << item.draw_count
+                  << " ever_sampled=" << (item.draw_count > 0 ? "true" : "false")
+                  << " reason=FIFO_READY_CAPACITY" << std::endl;
     }
 }
 
 rl::training::v1::PressureState
 SamplePoolCoordinator::PressureStateLocked() const {
-    const double sample_ratio = static_cast<double>(resident_samples_) /
-                                config_.max_queue_samples;
-    const double fragment_ratio = static_cast<double>(resident_fragments_) /
-                                  config_.max_queue_fragments;
-    const double byte_ratio = static_cast<double>(resident_estimated_bytes_) /
-                              config_.max_queue_estimated_bytes;
-    const double ratio = std::max({sample_ratio, fragment_ratio, byte_ratio});
-    if (ratio >= 1.0) return rl::training::v1::PRESSURE_STATE_FULL;
-    if (ratio >= config_.high_watermark_ratio) {
-        return rl::training::v1::PRESSURE_STATE_HIGH;
+    if (resident_transitions_ >= config_.capacity_transitions ||
+        resident_estimated_bytes_ >= config_.capacity_bytes) {
+        return rl::training::v1::PRESSURE_STATE_FULL;
     }
-    return rl::training::v1::PRESSURE_STATE_NORMAL;
+    const double transition_ratio =
+        static_cast<double>(resident_transitions_) /
+        static_cast<double>(config_.capacity_transitions);
+    const double byte_ratio =
+        static_cast<double>(resident_estimated_bytes_) /
+        static_cast<double>(config_.capacity_bytes);
+    return std::max(transition_ratio, byte_ratio) >=
+                   config_.high_watermark_ratio
+               ? rl::training::v1::PRESSURE_STATE_HIGH
+               : rl::training::v1::PRESSURE_STATE_NORMAL;
 }
 
 void SamplePoolCoordinator::FillServiceIdentity(
@@ -416,34 +479,50 @@ void SamplePoolCoordinator::FillContractIdentity(
     identity->set_generator_identity(config_.contract.generator_identity);
 }
 
-void SamplePoolCoordinator::RememberDeliveryLocked(
-    const std::string& delivery_id,
-    const DeliveryRecord& record) {
-    if (delivery_history_.find(delivery_id) == delivery_history_.end()) {
-        delivery_history_order_.push_back(delivery_id);
+void SamplePoolCoordinator::RequeueLeaseLocked(bool expired) {
+    if (!has_lease_) return;
+    const int64_t count = lease_.transition_count;
+    backend_->RestoreReady(std::move(lease_.items));
+    ready_transitions_ += count;
+    ready_estimated_bytes_ += lease_.estimated_bytes;
+    if (expired) {
+        ++expired_lease_count_;
+        redelivery_count_ += count;
     }
-    delivery_history_[delivery_id] = record;
-    while (static_cast<int>(delivery_history_order_.size()) >
-           config_.delivery_history_size) {
-        const std::string oldest = delivery_history_order_.front();
-        delivery_history_order_.pop_front();
-        delivery_history_.erase(oldest);
+    lease_ = Lease{};
+    has_lease_ = false;
+    cv_.notify_all();
+}
+
+void SamplePoolCoordinator::ReclaimExpiredLeaseLocked() {
+    if (has_lease_ &&
+        std::chrono::steady_clock::now() >= lease_.deadline) {
+        RequeueLeaseLocked(true);
     }
 }
 
-void SamplePoolCoordinator::RememberCompletedBatchLocked(
-    const std::string& batch_id,
-    const SampleBatchFingerprint& fingerprint) {
-    if (completed_batch_fingerprints_.find(batch_id) ==
-        completed_batch_fingerprints_.end()) {
-        completed_batch_order_.push_back(batch_id);
+void SamplePoolCoordinator::RememberDeliveryLocked(
+    const std::string& delivery_id,
+    const DeliveryRecord& record) {
+    delivery_history_[delivery_id] = record;
+    delivery_history_order_.push_back(delivery_id);
+    while (delivery_history_order_.size() >
+           static_cast<size_t>(config_.delivery_history_size)) {
+        delivery_history_.erase(delivery_history_order_.front());
+        delivery_history_order_.pop_front();
     }
-    completed_batch_fingerprints_[batch_id] = fingerprint;
-    while (static_cast<int64_t>(completed_batch_order_.size()) >
-           config_.max_dedup_entries) {
-        const std::string oldest = completed_batch_order_.front();
-        completed_batch_order_.pop_front();
-        completed_batch_fingerprints_.erase(oldest);
+}
+
+void SamplePoolCoordinator::RememberCompletedEnvelopeLocked(
+    const std::string& envelope_id,
+    const EnvelopeFingerprint& fingerprint) {
+    completed_envelope_fingerprints_[envelope_id] = fingerprint;
+    completed_envelope_order_.push_back(envelope_id);
+    while (completed_envelope_order_.size() >
+           static_cast<size_t>(config_.max_dedup_entries)) {
+        completed_envelope_fingerprints_.erase(
+            completed_envelope_order_.front());
+        completed_envelope_order_.pop_front();
     }
 }
 
@@ -454,211 +533,241 @@ SamplePoolCoordinator::DeliveryHistoryLocked(
     return found == delivery_history_.end() ? nullptr : &found->second;
 }
 
-bool SamplePoolCoordinator::PolicyMatchesFreshnessLocked(
-    const rl::training::v1::BehaviorPolicyReference& policy,
-    const rl::training::v1::SampleFreshnessPolicy& freshness) const {
-    if (policy.model_lineage_id() != freshness.model_lineage_id() ||
-        policy.distribution_schema_id() !=
-            freshness.distribution_schema_id() ||
-        policy.policy_spec_digest().SerializeAsString() !=
-            freshness.policy_spec_digest().SerializeAsString() ||
-        !policy.has_model_step() ||
-        !freshness.has_reference_model_step() ||
-        policy.model_step() > freshness.reference_model_step()) {
-        return false;
-    }
-    return freshness.reference_model_step() - policy.model_step() <=
-           freshness.max_model_step_lag();
+void SamplePoolCoordinator::FillDeliveryResponseLocked(
+    rl::training::v1::DeliveryRsp* response) const {
+    response->set_queue_size(ready_transitions_);
 }
 
-bool SamplePoolCoordinator::FragmentEligibleLocked(
-    const StoredFragment& fragment,
-    const rl::training::v1::SampleFreshnessPolicy& freshness,
-    const rl::training::v1::TrainingSemanticsIdentity& semantics,
-    int64_t minimum_created_at_unix_ms) const {
-    return fragment.batch.created_at_unix_ms() >=
-               minimum_created_at_unix_ms &&
-           fragment.batch.training_semantics().SerializeAsString() ==
-               semantics.SerializeAsString() &&
-           PolicyMatchesFreshnessLocked(fragment.batch.behavior_policy(),
-                                        freshness);
+void SamplePoolCoordinator::FillFinalizeResponseLocked(
+    rl::training::v1::FinalizeSamplePoolRsp* response) const {
+    response->set_finalization_id(finalization_id_);
+    FillServiceIdentity(response->mutable_sample_pool());
+    response->set_settled_transitions(finalized_transition_count_);
+    response->set_ready_transitions(ready_transitions_);
+    response->set_leased_transitions(
+        has_lease_ ? lease_.transition_count : 0);
+    response->set_resident_transitions(resident_transitions_);
+    if (finalized_at_unix_ms_ > 0) {
+        response->set_finalized_at_unix_ms(finalized_at_unix_ms_);
+    }
 }
 
-std::vector<SamplePoolCoordinator::PolicyAvailability>
-SamplePoolCoordinator::EligibleAvailabilityLocked(
-    const rl::training::v1::SampleFreshnessPolicy& freshness,
-    const rl::training::v1::TrainingSemanticsIdentity& semantics,
-    int64_t minimum_created_at_unix_ms) const {
-    std::map<std::string, PolicyAvailability> by_policy;
-    size_t fifo_index = 0;
-    for (const auto& fragment : backend_->ready()) {
-        if (FragmentEligibleLocked(fragment, freshness, semantics,
-                                   minimum_created_at_unix_ms)) {
-            auto [iterator, inserted] = by_policy.emplace(
-                fragment.policy_key,
-                PolicyAvailability{fragment.policy_key, 0, fifo_index});
-            iterator->second.sample_count += fragment.sample_count;
-            if (inserted) iterator->second.first_fifo_index = fifo_index;
-        }
-        ++fifo_index;
-    }
-    std::vector<PolicyAvailability> availability;
-    availability.reserve(by_policy.size());
-    for (auto& [key, value] : by_policy) {
-        (void)key;
-        availability.push_back(std::move(value));
-    }
-    return availability;
-}
-
-std::string SamplePoolCoordinator::OldestEligiblePolicyLocked(
-    const rl::training::v1::SampleFreshnessPolicy& freshness,
-    const rl::training::v1::TrainingSemanticsIdentity& semantics,
-    int64_t minimum_created_at_unix_ms,
-    int64_t minimum_samples) const {
-    std::string selected;
-    size_t selected_index = std::numeric_limits<size_t>::max();
-    for (const auto& available : EligibleAvailabilityLocked(
-             freshness, semantics, minimum_created_at_unix_ms)) {
-        if (available.sample_count < minimum_samples) continue;
-        if (available.first_fifo_index < selected_index) {
-            selected = available.policy_key;
-            selected_index = available.first_fifo_index;
-        }
-    }
-    return selected;
+int64_t SamplePoolCoordinator::EligibleReadyCountLocked(
+    const std::string& semantics_key,
+    const std::string& profile_digest_hex) const {
+    return static_cast<int64_t>(std::count_if(
+        backend_->ready().begin(), backend_->ready().end(),
+        [&](const StoredTransition& item) {
+            return item.semantics_key == semantics_key &&
+                   item.profile_digest_hex == profile_digest_hex;
+        }));
 }
 
 void SamplePoolCoordinator::Push(
     const rl::training::v1::PushSamplesReq& request,
     rl::training::v1::PushSamplesRsp* response) {
-    response->Clear();
-    const auto& batch = request.batch();
-    const int64_t sample_count = CountSamples(batch);
-    const int64_t estimated_bytes = EstimateBytes(batch);
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     ReclaimExpiredLeaseLocked();
     ++push_attempt_count_;
-    response->set_batch_id(batch.batch_id());
+
+    const auto& envelope = request.envelope();
+    const int64_t attempted = envelope.transitions_size();
+    response->set_envelope_id(envelope.envelope_id());
     FillServiceIdentity(response->mutable_sample_pool());
 
-    std::string error;
-    rl::training::v1::PushResult validation_rejection =
-        rl::training::v1::PUSH_RESULT_REJECTED_INVALID;
     if (finalized_) {
         ++rejected_push_attempt_count_;
-        rejected_sample_attempts_ += sample_count;
-        last_error_ = "sample pool is finalized";
+        rejected_transition_attempts_ += attempted;
         response->set_ret_code(1);
-        response->set_message(last_error_);
         response->set_result(
             rl::training::v1::PUSH_RESULT_REJECTED_FINALIZED);
-    } else if (!ValidateBatchLocked(batch, &error, &validation_rejection)) {
-        ++rejected_push_attempt_count_;
-        rejected_sample_attempts_ += sample_count;
-        last_error_ = error;
-        response->set_ret_code(-1);
-        response->set_message(error);
-        response->set_result(validation_rejection);
-    } else {
-        const SampleBatchFingerprint fingerprint = FingerprintBatch(batch);
-        const auto active = active_batch_fingerprints_.find(batch.batch_id());
-        const auto completed =
-            completed_batch_fingerprints_.find(batch.batch_id());
-        if (active != active_batch_fingerprints_.end() ||
-            completed != completed_batch_fingerprints_.end()) {
-            const SampleBatchFingerprint& prior =
-                active != active_batch_fingerprints_.end() ? active->second
-                                                            : completed->second;
-            if (prior == fingerprint) {
-                ++duplicate_push_attempt_count_;
-                duplicate_sample_attempts_ += sample_count;
-                last_error_.clear();
-                response->set_ret_code(0);
-                response->set_message("batch already accepted");
-                response->set_result(
-                    rl::training::v1::PUSH_RESULT_DUPLICATE);
-            } else {
-                ++rejected_push_attempt_count_;
-                rejected_sample_attempts_ += sample_count;
-                last_error_ = "batch_id conflicts with a prior payload";
-                response->set_ret_code(-1);
-                response->set_message(last_error_);
-                response->set_result(
-                    rl::training::v1::PUSH_RESULT_REJECTED_CONFLICT);
-            }
-        } else {
-            const std::string policy_key =
-                PolicyKey(batch.behavior_policy(), batch.training_semantics());
-            const auto known_policy = behavior_policy_by_key_.find(policy_key);
-            const auto known_semantics =
-                training_semantics_by_key_.find(policy_key);
-            const bool policy_conflict =
-                known_policy != behavior_policy_by_key_.end() &&
-                (known_policy->second.SerializeAsString() !=
-                     batch.behavior_policy().SerializeAsString() ||
-                 known_semantics == training_semantics_by_key_.end() ||
-                 known_semantics->second.SerializeAsString() !=
-                     batch.training_semantics().SerializeAsString());
-            if (policy_conflict) {
-                ++rejected_push_attempt_count_;
-                rejected_sample_attempts_ += sample_count;
-                last_error_ = "policy key conflicts with behavior identity";
-                response->set_ret_code(-1);
-                response->set_message(last_error_);
-                response->set_result(
-                    rl::training::v1::PUSH_RESULT_REJECTED_IDENTITY);
-            } else if (!CanMakeCapacityLocked(sample_count, 1,
-                                               estimated_bytes)) {
-                ++rejected_push_attempt_count_;
-                rejected_sample_attempts_ += sample_count;
-                last_error_ =
-                    "fragment exceeds capacity protected by the active lease";
-                response->set_ret_code(-1);
-                response->set_message(last_error_);
-                response->set_result(
-                    rl::training::v1::PUSH_RESULT_REJECTED_CAPACITY);
-            } else {
-                EvictReadyUntilCapacityLocked(sample_count, 1,
-                                               estimated_bytes);
-                behavior_policy_by_key_[policy_key] = batch.behavior_policy();
-                training_semantics_by_key_[policy_key] =
-                    batch.training_semantics();
-                StoredFragment stored;
-                stored.batch = batch;
-                stored.fingerprint = fingerprint;
-                stored.policy_key = policy_key;
-                stored.sample_count = sample_count;
-                stored.estimated_bytes = estimated_bytes;
-                backend_->PushBack(std::move(stored));
+        response->set_message("SamplePool ingress is finalized");
+        response->set_resident_transitions(resident_transitions_);
+        response->set_resident_envelopes(resident_by_envelope_.size());
+        response->set_resident_estimated_bytes(resident_estimated_bytes_);
+        response->set_pressure_state(PressureStateLocked());
+        return;
+    }
 
-                auto& counters = policy_counters_[policy_key];
-                counters.behavior_policy = batch.behavior_policy();
-                counters.ready_samples += sample_count;
-                ++counters.ready_fragments;
-                ready_samples_ += sample_count;
-                ++ready_fragments_;
-                ready_estimated_bytes_ += estimated_bytes;
-                resident_samples_ += sample_count;
-                ++resident_fragments_;
-                resident_estimated_bytes_ += estimated_bytes;
-                accepted_unique_samples_ += sample_count;
-                ++accepted_unique_batches_;
-                active_batch_fingerprints_[batch.batch_id()] = fingerprint;
-                last_error_.clear();
-                response->set_ret_code(0);
-                response->set_message("accepted");
-                response->set_result(
-                    rl::training::v1::PUSH_RESULT_ACCEPTED);
-                response->set_accepted_samples(sample_count);
-                response->set_accepted_unique_samples(sample_count);
+    std::string error;
+    auto rejection = rl::training::v1::PUSH_RESULT_REJECTED_INVALID;
+    if (!ValidateEnvelopeLocked(envelope, &error, &rejection)) {
+        ++rejected_push_attempt_count_;
+        rejected_transition_attempts_ += attempted;
+        last_error_ = error;
+        response->set_ret_code(1);
+        response->set_result(rejection);
+        response->set_message(error);
+        response->set_resident_transitions(resident_transitions_);
+        response->set_resident_envelopes(resident_by_envelope_.size());
+        response->set_resident_estimated_bytes(resident_estimated_bytes_);
+        response->set_pressure_state(PressureStateLocked());
+        return;
+    }
+
+    const EnvelopeFingerprint envelope_fingerprint =
+        FingerprintEnvelope(envelope);
+    const auto existing_envelope =
+        completed_envelope_fingerprints_.find(envelope.envelope_id());
+    if (existing_envelope != completed_envelope_fingerprints_.end()) {
+        if (existing_envelope->second == envelope_fingerprint) {
+            ++duplicate_push_attempt_count_;
+            duplicate_transition_attempts_ += attempted;
+            response->set_ret_code(0);
+            response->set_result(rl::training::v1::PUSH_RESULT_DUPLICATE);
+            response->set_message("envelope already accepted");
+        } else {
+            ++rejected_push_attempt_count_;
+            rejected_transition_attempts_ += attempted;
+            last_error_ = "envelope identity reused with different bytes";
+            response->set_ret_code(1);
+            response->set_result(
+                rl::training::v1::PUSH_RESULT_REJECTED_CONFLICT);
+            response->set_message(last_error_);
+        }
+        response->set_resident_transitions(resident_transitions_);
+        response->set_resident_envelopes(resident_by_envelope_.size());
+        response->set_resident_estimated_bytes(resident_estimated_bytes_);
+        response->set_pressure_state(PressureStateLocked());
+        return;
+    }
+
+    int existing_item_count = 0;
+    for (const auto& transition : envelope.transitions()) {
+        const auto existing =
+            seen_item_fingerprints_.find(transition.item_id());
+        if (existing == seen_item_fingerprints_.end()) continue;
+        ++existing_item_count;
+        if (existing->second != FingerprintTransition(transition)) {
+            ++rejected_push_attempt_count_;
+            rejected_transition_attempts_ += attempted;
+            last_error_ =
+                "item identity reused with different processed transition";
+            response->set_ret_code(1);
+            response->set_result(
+                rl::training::v1::PUSH_RESULT_REJECTED_CONFLICT);
+            response->set_message(last_error_);
+            response->set_resident_transitions(resident_transitions_);
+            response->set_resident_envelopes(resident_by_envelope_.size());
+            response->set_resident_estimated_bytes(resident_estimated_bytes_);
+            response->set_pressure_state(PressureStateLocked());
+            return;
+        }
+    }
+    if (existing_item_count > 0) {
+        if (existing_item_count == attempted) {
+            ++duplicate_push_attempt_count_;
+            duplicate_transition_attempts_ += attempted;
+            RememberCompletedEnvelopeLocked(
+                envelope.envelope_id(), envelope_fingerprint);
+            response->set_ret_code(0);
+            response->set_result(rl::training::v1::PUSH_RESULT_DUPLICATE);
+            response->set_message("all envelope items were already accepted");
+        } else {
+            ++rejected_push_attempt_count_;
+            rejected_transition_attempts_ += attempted;
+            last_error_ =
+                "envelope partially overlaps previously accepted item identities";
+            response->set_ret_code(1);
+            response->set_result(
+                rl::training::v1::PUSH_RESULT_REJECTED_CONFLICT);
+            response->set_message(last_error_);
+        }
+        response->set_resident_transitions(resident_transitions_);
+        response->set_resident_envelopes(resident_by_envelope_.size());
+        response->set_resident_estimated_bytes(resident_estimated_bytes_);
+        response->set_pressure_state(PressureStateLocked());
+        return;
+    }
+
+    int64_t incoming_bytes = 0;
+    try {
+        for (const auto& transition : envelope.transitions()) {
+            const int64_t bytes = EstimateBytes(transition);
+            if (incoming_bytes >
+                std::numeric_limits<int64_t>::max() - bytes) {
+                throw std::overflow_error("envelope byte total overflow");
             }
+            incoming_bytes += bytes;
+        }
+    } catch (const std::exception& exception) {
+        ++rejected_push_attempt_count_;
+        rejected_transition_attempts_ += attempted;
+        last_error_ = exception.what();
+        response->set_ret_code(1);
+        response->set_result(
+            rl::training::v1::PUSH_RESULT_REJECTED_INVALID);
+        response->set_message(last_error_);
+        return;
+    }
+
+    if (!CanMakeCapacityLocked(attempted, incoming_bytes)) {
+        ++rejected_push_attempt_count_;
+        rejected_transition_attempts_ += attempted;
+        last_error_ = "insufficient evictable READY capacity";
+        response->set_ret_code(1);
+        response->set_result(
+            rl::training::v1::PUSH_RESULT_REJECTED_CAPACITY);
+        response->set_message(last_error_);
+        response->set_resident_transitions(resident_transitions_);
+        response->set_resident_envelopes(resident_by_envelope_.size());
+        response->set_resident_estimated_bytes(resident_estimated_bytes_);
+        response->set_pressure_state(PressureStateLocked());
+        return;
+    }
+    EvictReadyUntilCapacityLocked(attempted, incoming_bytes);
+
+    const int64_t inserted_at = NowMs();
+    const std::string semantics_key =
+        SemanticsKey(envelope.training_semantics());
+    for (const auto& transition : envelope.transitions()) {
+        StoredTransition stored;
+        stored.transition = transition;
+        stored.training_semantics = envelope.training_semantics();
+        stored.envelope_id = envelope.envelope_id();
+        stored.semantics_key = semantics_key;
+        stored.profile_digest_hex =
+            transition.rollout_estimator_profile_digest().hex();
+        stored.insert_sequence = next_insert_sequence_++;
+        stored.inserted_at_unix_ms = inserted_at;
+        stored.estimated_bytes = EstimateBytes(transition);
+        backend_->PushBack(std::move(stored));
+        ++ready_transitions_;
+        ++resident_transitions_;
+        ready_estimated_bytes_ += EstimateBytes(transition);
+        resident_estimated_bytes_ += EstimateBytes(transition);
+        resident_item_ids_.insert(transition.item_id());
+        seen_item_fingerprints_[transition.item_id()] =
+            FingerprintTransition(transition);
+        seen_item_order_.push_back(transition.item_id());
+    }
+    resident_by_envelope_[envelope.envelope_id()] += attempted;
+    RememberCompletedEnvelopeLocked(
+        envelope.envelope_id(), envelope_fingerprint);
+
+    size_t examined = seen_item_order_.size();
+    while (seen_item_fingerprints_.size() >
+               static_cast<size_t>(config_.max_dedup_entries) &&
+           examined-- > 0) {
+        const std::string item_id = seen_item_order_.front();
+        seen_item_order_.pop_front();
+        if (resident_item_ids_.count(item_id) > 0) {
+            seen_item_order_.push_back(item_id);
+        } else {
+            seen_item_fingerprints_.erase(item_id);
         }
     }
 
-    response->set_queue_size(ready_samples_);
-    response->set_resident_samples(resident_samples_);
-    response->set_resident_fragments(resident_fragments_);
+    accepted_unique_transitions_ += attempted;
+    ++accepted_unique_envelopes_;
+    response->set_ret_code(0);
+    response->set_result(rl::training::v1::PUSH_RESULT_ACCEPTED);
+    response->set_message("accepted");
+    response->set_accepted_transitions(attempted);
+    response->set_accepted_unique_transitions(attempted);
+    response->set_queue_size(ready_transitions_);
+    response->set_resident_transitions(resident_transitions_);
+    response->set_resident_envelopes(resident_by_envelope_.size());
     response->set_resident_estimated_bytes(resident_estimated_bytes_);
     response->set_pressure_state(PressureStateLocked());
     cv_.notify_all();
@@ -668,560 +777,313 @@ void SamplePoolCoordinator::GetBatch(
     const rl::training::v1::GetBatchReq& request,
     rl::training::v1::GetBatchRsp* response,
     const std::function<bool()>& is_cancelled) {
-    response->Clear();
-    const int target_samples = request.assembly().target_samples();
-    const int max_samples = request.assembly().max_samples();
-    const int timeout_ms = request.timeout_ms() > 0
-                               ? request.timeout_ms()
-                               : config_.default_get_timeout_ms;
-    const int lease_timeout_ms = request.lease_timeout_ms() > 0
-                                     ? request.lease_timeout_ms()
-                                     : config_.default_lease_timeout_ms;
-    const auto mode = request.assembly().mode();
-    const auto start = std::chrono::steady_clock::now();
-    const auto wait_deadline = start + std::chrono::milliseconds(timeout_ms);
-
+    const auto started = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> lock(mutex_);
     ReclaimExpiredLeaseLocked();
     FillServiceIdentity(response->mutable_sample_pool());
-    if (finalized_) {
-        response->set_ret_code(-1);
-        response->set_result(
-            rl::training::v1::GET_BATCH_RESULT_REJECTED);
-        response->set_message("sample pool is finalized");
-        response->set_queue_size(ready_samples_);
-        return;
-    }
-    std::string semantics_error;
-    if (!IsServiceIdentityValid(request.consumer()) || target_samples <= 0 ||
-        max_samples < target_samples || timeout_ms <= 0 ||
-        lease_timeout_ms <= 0 ||
-        request.freshness().model_lineage_id().empty() ||
-        !request.freshness().has_reference_model_step() ||
-        request.freshness().distribution_schema_id().empty() ||
-        !IsSha256(request.freshness().policy_spec_digest()) ||
-        request.freshness().max_sample_age_ms() <= 0 ||
-        !ValidateSemantics(request.required_semantics(), &semantics_error) ||
-        request.freshness().distribution_schema_id() !=
-            request.required_semantics().policy_distribution_schema_id() ||
-        (mode != rl::training::v1::BATCH_ASSEMBLY_MODE_TARGET_BOUNDED &&
-         mode != rl::training::v1::BATCH_ASSEMBLY_MODE_DRAIN_AVAILABLE) ||
-        (mode == rl::training::v1::BATCH_ASSEMBLY_MODE_TARGET_BOUNDED &&
-         max_samples - target_samples + 1 < config_.max_fragment_samples)) {
-        response->set_ret_code(-1);
+
+    std::string error;
+    if (request.requested_transitions() <= 0 ||
+        request.timeout_ms() <= 0 || request.lease_timeout_ms() <= 0 ||
+        !IsServiceIdentityValid(request.consumer()) ||
+        !ValidateSemantics(request.required_semantics(), &error) ||
+        !IsSha256(request.required_rollout_estimator_profile_digest())) {
+        response->set_ret_code(1);
         response->set_result(rl::training::v1::GET_BATCH_RESULT_REJECTED);
-        response->set_message("invalid GetBatch request");
-        response->set_queue_size(ready_samples_);
+        response->set_message(
+            error.empty() ? "draw request is invalid" : error);
+        response->set_queue_size(ready_transitions_);
         return;
     }
 
-    const auto cancellation_requested = [&]() {
-        return is_cancelled && is_cancelled();
-    };
-    const auto wait_deadline_reached = [&]() {
-        return std::chrono::steady_clock::now() >= wait_deadline;
-    };
-    const auto minimum_created_at = [&]() {
-        const int64_t now = NowMs();
-        const int64_t maximum_age = request.freshness().max_sample_age_ms();
-        return maximum_age >= now ? int64_t{0} : now - maximum_age;
-    };
-    const auto finish_without_lease = [&](bool cancelled) {
-        response->Clear();
-        FillServiceIdentity(response->mutable_sample_pool());
-        if (cancelled) {
-            response->set_ret_code(-1);
-            response->set_result(
-                rl::training::v1::GET_BATCH_RESULT_REJECTED);
-            response->set_message("request cancelled before lease commit");
-        } else {
-            ++empty_timeout_count_;
-            response->set_ret_code(1);
-            response->set_result(
-                rl::training::v1::GET_BATCH_RESULT_TIMEOUT);
-            response->set_message(
-                "compatible samples not available before deadline");
-        }
-        response->set_queue_size(ready_samples_);
-        response->set_wait_ms(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - start)
-                .count());
-    };
-    const auto abort_before_lease = [&]() {
-        const bool cancelled = cancellation_requested();
-        if (!cancelled && !wait_deadline_reached()) return false;
-        finish_without_lease(cancelled);
-        return true;
-    };
+    const std::string consumer_key = ServiceKey(request.consumer());
+    const std::string semantics_key =
+        SemanticsKey(request.required_semantics());
+    const std::string profile_digest =
+        request.required_rollout_estimator_profile_digest().hex();
+    ++draw_attempt_count_;
+    const auto timeout =
+        std::chrono::milliseconds(request.timeout_ms());
+    const auto deadline = started + timeout;
 
-    if (abort_before_lease()) return;
-    if (has_lease_) {
-        ++consumer_busy_count_;
-        response->set_ret_code(2);
-        response->set_result(rl::training::v1::GET_BATCH_RESULT_BUSY);
-        response->set_message("another delivery is still leased");
-        response->set_queue_size(ready_samples_);
-        response->set_leased_samples(lease_.sample_count);
-        return;
-    }
-
-    const auto selected_policy = [&]() {
-        return OldestEligiblePolicyLocked(
-            request.freshness(), request.required_semantics(),
-            minimum_created_at(),
-            mode == rl::training::v1::BATCH_ASSEMBLY_MODE_TARGET_BOUNDED
-                ? target_samples
-                : 1);
-    };
-
-    std::string policy_key = selected_policy();
-    while (policy_key.empty() &&
-           std::chrono::steady_clock::now() < wait_deadline) {
-        if (abort_before_lease()) return;
-        cv_.wait_until(lock,
-                       std::min(wait_deadline,
-                                std::chrono::steady_clock::now() +
-                                    std::chrono::milliseconds(50)));
+    while (true) {
         ReclaimExpiredLeaseLocked();
-        if (finalized_) {
-            response->Clear();
-            FillServiceIdentity(response->mutable_sample_pool());
-            response->set_ret_code(-1);
-            response->set_result(
-                rl::training::v1::GET_BATCH_RESULT_REJECTED);
-            response->set_message("sample pool is finalized");
-            response->set_queue_size(ready_samples_);
-            return;
-        }
         if (has_lease_) {
             ++consumer_busy_count_;
-            response->set_ret_code(2);
+            response->set_ret_code(1);
             response->set_result(rl::training::v1::GET_BATCH_RESULT_BUSY);
-            response->set_message("another delivery is still leased");
-            response->set_queue_size(ready_samples_);
-            response->set_leased_samples(lease_.sample_count);
+            response->set_message("single consumer lease is active");
+            response->set_queue_size(ready_transitions_);
             return;
         }
-        policy_key = selected_policy();
-    }
-    if (abort_before_lease()) return;
-    if (policy_key.empty()) {
-        finish_without_lease(false);
-        return;
-    }
-
-    const int64_t created_floor = minimum_created_at();
-    std::deque<StoredFragment> preview;
-    int64_t preview_samples = 0;
-    int64_t preview_bytes = 0;
-    for (const auto& fragment : backend_->ready()) {
-        const bool still_collecting =
-            mode == rl::training::v1::BATCH_ASSEMBLY_MODE_DRAIN_AVAILABLE ||
-            preview_samples < target_samples;
-        if (!still_collecting || fragment.policy_key != policy_key ||
-            !FragmentEligibleLocked(fragment, request.freshness(),
-                                    request.required_semantics(),
-                                    created_floor) ||
-            preview_samples + fragment.sample_count > max_samples) {
-            continue;
+        if (EligibleReadyCountLocked(semantics_key, profile_digest) >=
+            request.requested_transitions()) {
+            break;
         }
-        preview_samples += fragment.sample_count;
-        preview_bytes += fragment.estimated_bytes;
-        preview.push_back(fragment);
-    }
-    if (preview.empty() ||
-        (mode == rl::training::v1::BATCH_ASSEMBLY_MODE_TARGET_BOUNDED &&
-         preview_samples < target_samples)) {
-        response->set_ret_code(-1);
-        response->set_result(rl::training::v1::GET_BATCH_RESULT_REJECTED);
-        response->set_message("bounded assembly invariant violated");
-        response->set_queue_size(ready_samples_);
-        return;
+        if (is_cancelled() || std::chrono::steady_clock::now() >= deadline) {
+            ++empty_timeout_count_;
+            response->set_ret_code(0);
+            response->set_result(rl::training::v1::GET_BATCH_RESULT_TIMEOUT);
+            response->set_message("requested transition count is not ready");
+            response->set_queue_size(ready_transitions_);
+            response->set_wait_ms(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started)
+                    .count());
+            return;
+        }
+        cv_.wait_until(lock, deadline);
     }
 
-    uint64_t minimum_step = 0;
+    std::vector<StoredTransition> selected =
+        backend_->DrawUniformWithoutReplacement(
+            static_cast<size_t>(request.requested_transitions()),
+            semantics_key, profile_digest, &random_);
+    const int64_t leased_at = NowMs();
+    const int64_t lease_timeout_ms = request.lease_timeout_ms();
+    lease_.delivery_id = instance_id_ + "/delivery-" +
+                         std::to_string(next_delivery_sequence_++);
+    lease_.consumer_instance_id = consumer_key;
+    lease_.deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(lease_timeout_ms);
+    lease_.deadline_unix_ms = leased_at + lease_timeout_ms;
+    lease_.transition_count = selected.size();
+    lease_.estimated_bytes = 0;
+
+    uint64_t minimum_step = std::numeric_limits<uint64_t>::max();
     uint64_t maximum_step = 0;
-    int64_t oldest_created_at = 0;
-    int64_t newest_created_at = 0;
-    bool first_fragment = true;
-    for (const auto& fragment : preview) {
-        *response->add_batches() = fragment.batch;
-        const uint64_t step = fragment.batch.behavior_policy().model_step();
-        const int64_t created_at = fragment.batch.created_at_unix_ms();
-        if (first_fragment) {
-            minimum_step = maximum_step = step;
-            oldest_created_at = newest_created_at = created_at;
-            first_fragment = false;
-        } else {
-            minimum_step = std::min(minimum_step, step);
-            maximum_step = std::max(maximum_step, step);
-            oldest_created_at = std::min(oldest_created_at, created_at);
-            newest_created_at = std::max(newest_created_at, created_at);
-        }
+    int64_t oldest_created = std::numeric_limits<int64_t>::max();
+    int64_t newest_created = std::numeric_limits<int64_t>::min();
+    for (auto& item : selected) {
+        ++item.draw_count;
+        lease_.estimated_bytes += item.estimated_bytes;
+        auto* output = response->add_items();
+        *output->mutable_transition() = item.transition;
+        output->set_insert_sequence(item.insert_sequence);
+        output->set_inserted_at_unix_ms(item.inserted_at_unix_ms);
+        output->set_draw_count(item.draw_count);
+        minimum_step = std::min(
+            minimum_step, item.transition.behavior_policy().model_step());
+        maximum_step = std::max(
+            maximum_step, item.transition.behavior_policy().model_step());
+        oldest_created = std::min(
+            oldest_created, item.transition.created_at_unix_ms());
+        newest_created = std::max(
+            newest_created, item.transition.created_at_unix_ms());
     }
+    lease_.items = std::move(selected);
+    drawn_transition_slot_count_ += lease_.transition_count;
+    ready_transitions_ -= lease_.transition_count;
+    ready_estimated_bytes_ -= lease_.estimated_bytes;
+    has_lease_ = true;
+    ++target_hit_count_;
 
-    const bool cancelled_before_commit = cancellation_requested();
-    if (cancelled_before_commit || wait_deadline_reached()) {
-        finish_without_lease(cancelled_before_commit);
-        return;
-    }
-
-    std::deque<StoredFragment> selected = backend_->ExtractPolicy(
-        policy_key, created_floor, target_samples, max_samples,
-        mode == rl::training::v1::BATCH_ASSEMBLY_MODE_DRAIN_AVAILABLE);
-    if (selected.size() != preview.size()) {
-        backend_->RestoreFront(std::move(selected));
-        response->Clear();
-        FillServiceIdentity(response->mutable_sample_pool());
-        response->set_ret_code(-1);
-        response->set_result(rl::training::v1::GET_BATCH_RESULT_REJECTED);
-        response->set_message("storage selection changed before lease commit");
-        response->set_queue_size(ready_samples_);
-        return;
-    }
-
-    Lease new_lease;
-    new_lease.consumer_instance_id = ServiceKey(request.consumer());
-    new_lease.fragments = std::move(selected);
-    new_lease.sample_count = preview_samples;
-    new_lease.estimated_bytes = preview_bytes;
-    new_lease.delivery_id = instance_id_ + "-delivery-" +
-                            std::to_string(next_delivery_sequence_++);
-    new_lease.deadline = std::chrono::steady_clock::now() +
-                         std::chrono::milliseconds(lease_timeout_ms);
-    new_lease.deadline_unix_ms = NowMs() + lease_timeout_ms;
-
-    for (const auto& fragment : new_lease.fragments) {
-        auto& counters = policy_counters_[fragment.policy_key];
-        counters.ready_samples -= fragment.sample_count;
-        --counters.ready_fragments;
-        counters.leased_samples += fragment.sample_count;
-        ++counters.leased_fragments;
-    }
-    ready_samples_ -= new_lease.sample_count;
-    ready_fragments_ -= static_cast<int64_t>(new_lease.fragments.size());
-    ready_estimated_bytes_ -= new_lease.estimated_bytes;
-
-    if (new_lease.sample_count >= target_samples) {
-        ++target_hit_count_;
-    } else {
-        ++partial_get_count_;
-    }
     response->set_ret_code(0);
     response->set_result(rl::training::v1::GET_BATCH_RESULT_LEASED);
     response->set_message("leased");
-    response->set_delivery_id(new_lease.delivery_id);
-    response->set_lease_deadline_unix_ms(new_lease.deadline_unix_ms);
-    response->set_returned_samples(new_lease.sample_count);
-    response->set_actual_batch_size(new_lease.sample_count);
-    response->set_returned_fragments(
-        static_cast<int64_t>(new_lease.fragments.size()));
-    response->set_queue_size(ready_samples_);
-    response->set_leased_samples(new_lease.sample_count);
-    response->set_wait_ms(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - start)
-            .count());
+    response->set_delivery_id(lease_.delivery_id);
+    response->set_lease_deadline_unix_ms(lease_.deadline_unix_ms);
+    response->set_returned_transitions(lease_.transition_count);
+    response->set_actual_transition_count(lease_.transition_count);
+    response->set_leased_transitions(lease_.transition_count);
+    response->set_queue_size(ready_transitions_);
     response->set_minimum_behavior_model_step(minimum_step);
     response->set_maximum_behavior_model_step(maximum_step);
-    response->set_oldest_sample_created_at_unix_ms(oldest_created_at);
-    response->set_newest_sample_created_at_unix_ms(newest_created_at);
-    lease_ = std::move(new_lease);
-    has_lease_ = true;
-}
-
-void SamplePoolCoordinator::FillDeliveryResponseLocked(
-    rl::training::v1::DeliveryRsp* response) const {
-    response->set_queue_size(ready_samples_);
-    if (has_lease_) {
-        response->set_lease_deadline_unix_ms(lease_.deadline_unix_ms);
-    }
-}
-
-void SamplePoolCoordinator::FillFinalizeResponseLocked(
-    rl::training::v1::FinalizeSamplePoolRsp* response) const {
-    FillServiceIdentity(response->mutable_sample_pool());
-    response->set_settled_samples(finalized_sample_count_);
-    response->set_settled_fragments(finalized_fragment_count_);
-    response->set_ready_samples(ready_samples_);
-    response->set_ready_fragments(ready_fragments_);
-    response->set_leased_samples(has_lease_ ? lease_.sample_count : 0);
-    response->set_leased_fragments(
-        has_lease_ ? static_cast<int64_t>(lease_.fragments.size()) : 0);
-    response->set_resident_samples(resident_samples_);
-    response->set_resident_fragments(resident_fragments_);
-    response->set_finalized_at_unix_ms(finalized_at_unix_ms_);
-}
-
-void SamplePoolCoordinator::RequeueLeaseLocked(bool expired) {
-    if (!has_lease_) return;
-    for (const auto& fragment : lease_.fragments) {
-        auto& counters = policy_counters_[fragment.policy_key];
-        counters.ready_samples += fragment.sample_count;
-        ++counters.ready_fragments;
-        counters.leased_samples -= fragment.sample_count;
-        --counters.leased_fragments;
-    }
-    ready_samples_ += lease_.sample_count;
-    ready_fragments_ += static_cast<int64_t>(lease_.fragments.size());
-    ready_estimated_bytes_ += lease_.estimated_bytes;
-    backend_->RestoreFront(std::move(lease_.fragments));
-
-    DeliveryRecord record;
-    if (expired) {
-        ++expired_lease_count_;
-        record.result = rl::training::v1::DELIVERY_RESULT_EXPIRED;
-    } else {
-        ++nack_count_;
-        record.result = rl::training::v1::DELIVERY_RESULT_APPLIED;
-    }
-    ++redelivery_count_;
-    RememberDeliveryLocked(lease_.delivery_id, record);
-    lease_ = Lease{};
-    has_lease_ = false;
-    cv_.notify_all();
-}
-
-void SamplePoolCoordinator::ReclaimExpiredLeaseLocked() {
-    if (has_lease_ && std::chrono::steady_clock::now() >= lease_.deadline) {
-        RequeueLeaseLocked(true);
-    }
+    response->set_oldest_transition_created_at_unix_ms(oldest_created);
+    response->set_newest_transition_created_at_unix_ms(newest_created);
+    response->set_wait_ms(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count());
 }
 
 void SamplePoolCoordinator::Ack(
     const rl::training::v1::AckBatchReq& request,
     rl::training::v1::DeliveryRsp* response) {
-    response->Clear();
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     ReclaimExpiredLeaseLocked();
     response->set_delivery_id(request.delivery_id());
-    FillDeliveryResponseLocked(response);
-    const bool trained =
-        request.disposition() == rl::training::v1::ACK_DISPOSITION_TRAINED;
+
     if (!IsServiceIdentityValid(request.consumer()) ||
         request.delivery_id().empty() ||
-        request.disposition() ==
-            rl::training::v1::ACK_DISPOSITION_UNSPECIFIED ||
-        (trained && request.train_update_id().empty())) {
-        response->set_ret_code(-1);
+        !DeliveryBelongsToInstanceLocked(request.delivery_id())) {
+        response->set_ret_code(1);
         response->set_result(rl::training::v1::DELIVERY_RESULT_REJECTED);
-        response->set_message("invalid AckBatch request");
+        response->set_message("delivery or consumer identity is invalid");
+        FillDeliveryResponseLocked(response);
         return;
     }
-    if (!DeliveryBelongsToInstanceLocked(request.delivery_id())) {
-        response->set_ret_code(-1);
-        response->set_result(rl::training::v1::DELIVERY_RESULT_REJECTED);
-        response->set_message("delivery belongs to another pool instance");
-        return;
-    }
-    const DeliveryRecord* history = DeliveryHistoryLocked(request.delivery_id());
-    if (history != nullptr) {
-        if (history->result == rl::training::v1::DELIVERY_RESULT_EXPIRED) {
-            response->set_ret_code(1);
-            response->set_result(rl::training::v1::DELIVERY_RESULT_EXPIRED);
-            response->set_message("delivery lease expired");
-            return;
-        }
-        if (history->disposition != request.disposition() ||
-            history->train_update_id != request.train_update_id()) {
-            response->set_ret_code(-1);
-            response->set_result(rl::training::v1::DELIVERY_RESULT_REJECTED);
-            response->set_message("Ack retry conflicts with applied result");
-            return;
-        }
+    if (const DeliveryRecord* history =
+            DeliveryHistoryLocked(request.delivery_id())) {
         response->set_ret_code(0);
         response->set_result(
             rl::training::v1::DELIVERY_RESULT_ALREADY_APPLIED);
-        response->set_message("delivery already completed");
+        response->set_message("delivery settlement already applied");
         response->set_disposition(history->disposition);
         response->set_train_update_id(history->train_update_id);
+        response->set_affected_transitions(history->affected_transitions);
+        FillDeliveryResponseLocked(response);
         return;
     }
     if (!has_lease_ || lease_.delivery_id != request.delivery_id()) {
         response->set_ret_code(1);
         response->set_result(rl::training::v1::DELIVERY_RESULT_NOT_FOUND);
-        response->set_message("delivery not found");
+        response->set_message("active delivery not found");
+        FillDeliveryResponseLocked(response);
         return;
     }
     if (lease_.consumer_instance_id != ServiceKey(request.consumer())) {
-        response->set_ret_code(-1);
+        response->set_ret_code(1);
         response->set_result(rl::training::v1::DELIVERY_RESULT_REJECTED);
-        response->set_message("consumer identity does not own delivery");
+        response->set_message("delivery belongs to another consumer");
+        FillDeliveryResponseLocked(response);
+        return;
+    }
+    const auto disposition = request.disposition();
+    if (disposition != rl::training::v1::ACK_DISPOSITION_TRAINED &&
+        disposition != rl::training::v1::ACK_DISPOSITION_INVALID &&
+        disposition !=
+            rl::training::v1::ACK_DISPOSITION_SHUTDOWN_UNTRAINED) {
+        response->set_ret_code(1);
+        response->set_result(rl::training::v1::DELIVERY_RESULT_REJECTED);
+        response->set_message("ack disposition is invalid");
+        FillDeliveryResponseLocked(response);
+        return;
+    }
+    if (disposition == rl::training::v1::ACK_DISPOSITION_TRAINED &&
+        request.train_update_id().empty()) {
+        response->set_ret_code(1);
+        response->set_result(rl::training::v1::DELIVERY_RESULT_REJECTED);
+        response->set_message("trained acknowledgement requires update id");
+        FillDeliveryResponseLocked(response);
         return;
     }
 
-    const int64_t samples = lease_.sample_count;
-    const int64_t fragments =
-        static_cast<int64_t>(lease_.fragments.size());
-    for (const auto& fragment : lease_.fragments) {
-        auto& counters = policy_counters_[fragment.policy_key];
-        counters.leased_samples -= fragment.sample_count;
-        --counters.leased_fragments;
-        counters.acked_samples += fragment.sample_count;
-        ++counters.acked_fragments;
-        switch (request.disposition()) {
-            case rl::training::v1::ACK_DISPOSITION_TRAINED:
-                counters.trained_samples += fragment.sample_count;
-                break;
-            case rl::training::v1::ACK_DISPOSITION_STALE:
-                counters.stale_samples += fragment.sample_count;
-                break;
-            case rl::training::v1::ACK_DISPOSITION_INVALID:
-                counters.invalid_samples += fragment.sample_count;
-                break;
-            case rl::training::v1::ACK_DISPOSITION_SHUTDOWN_UNTRAINED:
-                counters.shutdown_untrained_samples += fragment.sample_count;
-                break;
-            default:
-                break;
-        }
+    const int64_t affected = lease_.transition_count;
+    for (const auto& item : lease_.items) RemoveResidentItemLocked(item);
+    if (disposition == rl::training::v1::ACK_DISPOSITION_TRAINED) {
+        trained_transition_count_ += affected;
+    } else if (disposition == rl::training::v1::ACK_DISPOSITION_INVALID) {
+        invalid_transition_count_ += affected;
+    } else {
+        shutdown_untrained_transition_count_ += affected;
     }
-    switch (request.disposition()) {
-        case rl::training::v1::ACK_DISPOSITION_TRAINED:
-            trained_sample_count_ += samples;
-            break;
-        case rl::training::v1::ACK_DISPOSITION_STALE:
-            stale_sample_count_ += samples;
-            break;
-        case rl::training::v1::ACK_DISPOSITION_INVALID:
-            invalid_sample_count_ += samples;
-            break;
-        case rl::training::v1::ACK_DISPOSITION_SHUTDOWN_UNTRAINED:
-            shutdown_untrained_sample_count_ += samples;
-            break;
-        default:
-            break;
-    }
-    resident_samples_ -= samples;
-    resident_fragments_ -= fragments;
-    resident_estimated_bytes_ -= lease_.estimated_bytes;
-    acked_unique_samples_ += samples;
-    acked_unique_batches_ += fragments;
-    for (const auto& fragment : lease_.fragments) {
-        const auto active =
-            active_batch_fingerprints_.find(fragment.batch.batch_id());
-        if (active != active_batch_fingerprints_.end()) {
-            RememberCompletedBatchLocked(fragment.batch.batch_id(),
-                                         active->second);
-            active_batch_fingerprints_.erase(active);
-        }
-    }
+    acked_unique_transitions_ += affected;
+    ++acked_unique_deliveries_;
     latest_ack_unix_ms_ = NowMs();
+
     DeliveryRecord record;
     record.result = rl::training::v1::DELIVERY_RESULT_APPLIED;
-    record.disposition = request.disposition();
+    record.disposition = disposition;
     record.train_update_id = request.train_update_id();
-    RememberDeliveryLocked(lease_.delivery_id, record);
+    record.affected_transitions = affected;
+    RememberDeliveryLocked(request.delivery_id(), record);
     lease_ = Lease{};
     has_lease_ = false;
+
     response->set_ret_code(0);
     response->set_result(rl::training::v1::DELIVERY_RESULT_APPLIED);
-    response->set_message("acked");
-    response->set_affected_samples(samples);
-    response->set_disposition(record.disposition);
-    response->set_train_update_id(record.train_update_id);
-    response->set_queue_size(ready_samples_);
+    response->set_message("delivery settled");
+    response->set_disposition(disposition);
+    response->set_train_update_id(request.train_update_id());
+    response->set_affected_transitions(affected);
+    FillDeliveryResponseLocked(response);
     cv_.notify_all();
 }
 
 void SamplePoolCoordinator::Nack(
     const rl::training::v1::NackBatchReq& request,
     rl::training::v1::DeliveryRsp* response) {
-    response->Clear();
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     ReclaimExpiredLeaseLocked();
     response->set_delivery_id(request.delivery_id());
-    FillDeliveryResponseLocked(response);
+
     if (!IsServiceIdentityValid(request.consumer()) ||
-        request.delivery_id().empty()) {
-        response->set_ret_code(-1);
+        request.delivery_id().empty() ||
+        !DeliveryBelongsToInstanceLocked(request.delivery_id())) {
+        response->set_ret_code(1);
         response->set_result(rl::training::v1::DELIVERY_RESULT_REJECTED);
-        response->set_message("invalid NackBatch request");
+        response->set_message("delivery or consumer identity is invalid");
+        FillDeliveryResponseLocked(response);
         return;
     }
-    if (!DeliveryBelongsToInstanceLocked(request.delivery_id())) {
-        response->set_ret_code(-1);
-        response->set_result(rl::training::v1::DELIVERY_RESULT_REJECTED);
-        response->set_message("delivery belongs to another pool instance");
-        return;
-    }
-    const DeliveryRecord* history = DeliveryHistoryLocked(request.delivery_id());
-    if (history != nullptr) {
-        response->set_ret_code(
-            history->result == rl::training::v1::DELIVERY_RESULT_EXPIRED ? 1
-                                                                         : 0);
+    if (const DeliveryRecord* history =
+            DeliveryHistoryLocked(request.delivery_id())) {
+        response->set_ret_code(0);
         response->set_result(
-            history->result == rl::training::v1::DELIVERY_RESULT_EXPIRED
-                ? rl::training::v1::DELIVERY_RESULT_EXPIRED
-                : rl::training::v1::DELIVERY_RESULT_ALREADY_APPLIED);
-        response->set_message("delivery already completed");
+            rl::training::v1::DELIVERY_RESULT_ALREADY_APPLIED);
+        response->set_message("delivery settlement already applied");
+        response->set_affected_transitions(history->affected_transitions);
+        FillDeliveryResponseLocked(response);
         return;
     }
     if (!has_lease_ || lease_.delivery_id != request.delivery_id()) {
         response->set_ret_code(1);
         response->set_result(rl::training::v1::DELIVERY_RESULT_NOT_FOUND);
-        response->set_message("delivery not found");
+        response->set_message("active delivery not found");
+        FillDeliveryResponseLocked(response);
         return;
     }
     if (lease_.consumer_instance_id != ServiceKey(request.consumer())) {
-        response->set_ret_code(-1);
+        response->set_ret_code(1);
         response->set_result(rl::training::v1::DELIVERY_RESULT_REJECTED);
-        response->set_message("consumer identity does not own delivery");
+        response->set_message("delivery belongs to another consumer");
+        FillDeliveryResponseLocked(response);
         return;
     }
-    const int64_t affected = lease_.sample_count;
-    RequeueLeaseLocked(false);
+
+    const int64_t affected = lease_.transition_count;
+    backend_->RestoreReady(std::move(lease_.items));
+    ready_transitions_ += affected;
+    ready_estimated_bytes_ += lease_.estimated_bytes;
+    ++nack_count_;
+    redelivery_count_ += affected;
+    DeliveryRecord record;
+    record.result = rl::training::v1::DELIVERY_RESULT_APPLIED;
+    record.affected_transitions = affected;
+    RememberDeliveryLocked(request.delivery_id(), record);
+    lease_ = Lease{};
+    has_lease_ = false;
+
     response->set_ret_code(0);
     response->set_result(rl::training::v1::DELIVERY_RESULT_APPLIED);
-    response->set_message("nacked and requeued");
-    response->set_affected_samples(affected);
-    response->set_queue_size(ready_samples_);
+    response->set_message("delivery returned to READY");
+    response->set_affected_transitions(affected);
+    FillDeliveryResponseLocked(response);
+    cv_.notify_all();
 }
 
 void SamplePoolCoordinator::RenewLease(
     const rl::training::v1::RenewLeaseReq& request,
     rl::training::v1::DeliveryRsp* response) {
-    response->Clear();
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     ReclaimExpiredLeaseLocked();
     response->set_delivery_id(request.delivery_id());
-    FillDeliveryResponseLocked(response);
     if (!IsServiceIdentityValid(request.consumer()) ||
-        request.delivery_id().empty() || request.lease_timeout_ms() <= 0) {
-        response->set_ret_code(-1);
-        response->set_result(rl::training::v1::DELIVERY_RESULT_REJECTED);
-        response->set_message("invalid RenewLease request");
-        return;
-    }
-    if (!DeliveryBelongsToInstanceLocked(request.delivery_id())) {
-        response->set_ret_code(-1);
-        response->set_result(rl::training::v1::DELIVERY_RESULT_REJECTED);
-        response->set_message("delivery belongs to another pool instance");
-        return;
-    }
-    const DeliveryRecord* history = DeliveryHistoryLocked(request.delivery_id());
-    if (history != nullptr) {
+        request.delivery_id().empty() || request.lease_timeout_ms() <= 0 ||
+        !DeliveryBelongsToInstanceLocked(request.delivery_id())) {
         response->set_ret_code(1);
-        response->set_result(
-            history->result == rl::training::v1::DELIVERY_RESULT_EXPIRED
-                ? rl::training::v1::DELIVERY_RESULT_EXPIRED
-                : rl::training::v1::DELIVERY_RESULT_NOT_FOUND);
-        response->set_message("delivery is no longer active");
+        response->set_result(rl::training::v1::DELIVERY_RESULT_REJECTED);
+        response->set_message("lease renewal request is invalid");
+        FillDeliveryResponseLocked(response);
         return;
     }
     if (!has_lease_ || lease_.delivery_id != request.delivery_id()) {
         response->set_ret_code(1);
         response->set_result(rl::training::v1::DELIVERY_RESULT_NOT_FOUND);
-        response->set_message("delivery not found");
+        response->set_message("active delivery not found");
+        FillDeliveryResponseLocked(response);
         return;
     }
     if (lease_.consumer_instance_id != ServiceKey(request.consumer())) {
-        response->set_ret_code(-1);
+        response->set_ret_code(1);
         response->set_result(rl::training::v1::DELIVERY_RESULT_REJECTED);
-        response->set_message("consumer identity does not own delivery");
+        response->set_message("delivery belongs to another consumer");
+        FillDeliveryResponseLocked(response);
         return;
     }
+
     lease_.deadline = std::chrono::steady_clock::now() +
                       std::chrono::milliseconds(request.lease_timeout_ms());
     lease_.deadline_unix_ms = NowMs() + request.lease_timeout_ms();
@@ -1229,136 +1091,69 @@ void SamplePoolCoordinator::RenewLease(
     response->set_ret_code(0);
     response->set_result(rl::training::v1::DELIVERY_RESULT_APPLIED);
     response->set_message("lease renewed");
-    response->set_affected_samples(lease_.sample_count);
     response->set_lease_deadline_unix_ms(lease_.deadline_unix_ms);
+    response->set_affected_transitions(lease_.transition_count);
+    FillDeliveryResponseLocked(response);
 }
 
 void SamplePoolCoordinator::FinalizeSamplePool(
     const rl::training::v1::FinalizeSamplePoolReq& request,
     rl::training::v1::FinalizeSamplePoolRsp* response) {
-    response->Clear();
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     ReclaimExpiredLeaseLocked();
-    response->set_finalization_id(request.finalization_id());
-    FillFinalizeResponseLocked(response);
-
-    const auto& expected = request.expected_sample_pool();
-    const bool identity_valid =
-        IsServiceIdentityValid(request.consumer()) &&
-        request.consumer().component() == "learner" &&
-        IsServiceIdentityValid(expected) &&
-        expected.component() == "sample-pool" &&
-        expected.instance_id() == instance_id_ &&
-        expected.lifecycle_epoch() == 1 &&
-        !request.finalization_id().empty() &&
-        request.finalization_id().size() <= 256;
-    if (!identity_valid) {
-        response->set_ret_code(-1);
-        response->set_result(
-            rl::training::v1::
-                SAMPLE_POOL_FINALIZE_RESULT_REJECTED_IDENTITY);
-        response->set_message("invalid SamplePool finalization identity");
-        return;
-    }
-
     const std::string consumer_key = ServiceKey(request.consumer());
-    if (finalized_) {
-        response->set_finalization_id(finalization_id_);
+    if (!IsServiceIdentityValid(request.consumer()) ||
+        request.finalization_id().empty() ||
+        request.expected_sample_pool().component() != "sample-pool" ||
+        request.expected_sample_pool().instance_id() != instance_id_ ||
+        request.expected_sample_pool().lifecycle_epoch() != 1) {
+        response->set_ret_code(1);
+        response->set_result(
+            rl::training::v1::SAMPLE_POOL_FINALIZE_RESULT_REJECTED_IDENTITY);
+        response->set_message("finalization identity is invalid");
         FillFinalizeResponseLocked(response);
-        if (request.finalization_id() == finalization_id_ &&
-            consumer_key == finalization_consumer_key_) {
-            response->set_ret_code(0);
-            response->set_result(
-                rl::training::v1::
-                    SAMPLE_POOL_FINALIZE_RESULT_ALREADY_FINALIZED);
-            response->set_message("sample pool already finalized");
-        } else {
-            response->set_ret_code(-1);
-            response->set_result(
-                rl::training::v1::
-                    SAMPLE_POOL_FINALIZE_RESULT_REJECTED_CONFLICT);
-            response->set_message(
-                "SamplePool finalization conflicts with applied identity");
-        }
         return;
     }
-
+    if (finalized_) {
+        const bool same = request.finalization_id() == finalization_id_ &&
+                          consumer_key == finalization_consumer_key_;
+        response->set_ret_code(same ? 0 : 1);
+        response->set_result(
+            same ? rl::training::v1::
+                       SAMPLE_POOL_FINALIZE_RESULT_ALREADY_FINALIZED
+                 : rl::training::v1::
+                       SAMPLE_POOL_FINALIZE_RESULT_REJECTED_CONFLICT);
+        response->set_message(
+            same ? "SamplePool already finalized"
+                 : "SamplePool finalized by another identity");
+        FillFinalizeResponseLocked(response);
+        return;
+    }
     if (has_lease_) {
         response->set_ret_code(1);
         response->set_result(
             rl::training::v1::
                 SAMPLE_POOL_FINALIZE_RESULT_REJECTED_ACTIVE_LEASE);
-        response->set_message(
-            "active delivery must settle before SamplePool finalization");
+        response->set_message("active lease must settle before finalization");
+        FillFinalizeResponseLocked(response);
         return;
     }
 
-    std::deque<StoredFragment> ready = backend_->ExtractAllReady();
-    int64_t extracted_samples = 0;
-    int64_t extracted_bytes = 0;
-    for (const auto& fragment : ready) {
-        extracted_samples += fragment.sample_count;
-        extracted_bytes += fragment.estimated_bytes;
-    }
-    const int64_t extracted_fragments =
-        static_cast<int64_t>(ready.size());
-    if (extracted_samples != ready_samples_ ||
-        extracted_fragments != ready_fragments_ ||
-        extracted_bytes != ready_estimated_bytes_ ||
-        resident_samples_ != ready_samples_ ||
-        resident_fragments_ != ready_fragments_ ||
-        resident_estimated_bytes_ != ready_estimated_bytes_) {
-        backend_->RestoreFront(std::move(ready));
-        last_error_ = "SamplePool ready-tail accounting is inconsistent";
-        response->set_ret_code(-1);
-        response->set_result(
-            rl::training::v1::
-                SAMPLE_POOL_FINALIZE_RESULT_REJECTED_CONFLICT);
-        response->set_message(last_error_);
-        return;
-    }
-
-    for (const auto& fragment : ready) {
-        auto& counters = policy_counters_[fragment.policy_key];
-        counters.ready_samples -= fragment.sample_count;
-        --counters.ready_fragments;
-        counters.acked_samples += fragment.sample_count;
-        ++counters.acked_fragments;
-        counters.shutdown_untrained_samples += fragment.sample_count;
-
-        const auto active =
-            active_batch_fingerprints_.find(fragment.batch.batch_id());
-        if (active != active_batch_fingerprints_.end()) {
-            RememberCompletedBatchLocked(fragment.batch.batch_id(),
-                                         active->second);
-            active_batch_fingerprints_.erase(active);
-        }
-    }
-
-    ready_samples_ = 0;
-    ready_fragments_ = 0;
+    std::vector<StoredTransition> tail = backend_->ExtractAllReady();
+    finalized_transition_count_ = tail.size();
+    for (const auto& item : tail) RemoveResidentItemLocked(item);
+    shutdown_untrained_transition_count_ += finalized_transition_count_;
+    ready_transitions_ = 0;
     ready_estimated_bytes_ = 0;
-    resident_samples_ = 0;
-    resident_fragments_ = 0;
-    resident_estimated_bytes_ = 0;
-    acked_unique_samples_ += extracted_samples;
-    acked_unique_batches_ += extracted_fragments;
-    shutdown_untrained_sample_count_ += extracted_samples;
-    latest_ack_unix_ms_ = NowMs();
     finalized_ = true;
     finalization_id_ = request.finalization_id();
     finalization_consumer_key_ = consumer_key;
-    finalized_at_unix_ms_ = latest_ack_unix_ms_;
-    finalized_sample_count_ = extracted_samples;
-    finalized_fragment_count_ = extracted_fragments;
-    last_error_.clear();
+    finalized_at_unix_ms_ = NowMs();
 
-    response->Clear();
     response->set_ret_code(0);
     response->set_result(
         rl::training::v1::SAMPLE_POOL_FINALIZE_RESULT_FINALIZED);
-    response->set_message("sample pool finalized");
-    response->set_finalization_id(finalization_id_);
+    response->set_message("READY tail settled as SHUTDOWN_UNTRAINED");
     FillFinalizeResponseLocked(response);
     cv_.notify_all();
 }
@@ -1367,41 +1162,47 @@ void SamplePoolCoordinator::FillStatusScalarsLocked(
     rl::training::v1::SamplePoolStatusRsp* response) const {
     FillContractIdentity(response->mutable_contract());
     FillServiceIdentity(response->mutable_sample_pool());
-    response->set_ready(!finalized_);
+    response->set_ready(true);
     response->set_push_attempt_count(push_attempt_count_);
-    response->set_accepted_unique_samples(accepted_unique_samples_);
-    response->set_accepted_unique_batches(accepted_unique_batches_);
-    response->set_duplicate_push_attempt_count(duplicate_push_attempt_count_);
-    response->set_duplicate_sample_attempts(duplicate_sample_attempts_);
-    response->set_rejected_push_attempt_count(rejected_push_attempt_count_);
-    response->set_rejected_sample_attempts(rejected_sample_attempts_);
-    response->set_acked_unique_samples(acked_unique_samples_);
-    response->set_acked_unique_batches(acked_unique_batches_);
-    response->set_ready_queue_samples(ready_samples_);
-    response->set_ready_queue_fragments(ready_fragments_);
-    response->set_leased_samples(has_lease_ ? lease_.sample_count : 0);
-    response->set_leased_fragments(
-        has_lease_ ? static_cast<int64_t>(lease_.fragments.size()) : 0);
-    response->set_resident_samples(resident_samples_);
-    response->set_resident_fragments(resident_fragments_);
+    response->set_accepted_unique_transitions(
+        accepted_unique_transitions_);
+    response->set_accepted_unique_envelopes(
+        accepted_unique_envelopes_);
+    response->set_duplicate_push_attempt_count(
+        duplicate_push_attempt_count_);
+    response->set_duplicate_transition_attempts(
+        duplicate_transition_attempts_);
+    response->set_rejected_push_attempt_count(
+        rejected_push_attempt_count_);
+    response->set_rejected_transition_attempts(
+        rejected_transition_attempts_);
+    response->set_acked_unique_transitions(acked_unique_transitions_);
+    response->set_acked_unique_deliveries(acked_unique_deliveries_);
+    response->set_ready_transitions(ready_transitions_);
+    response->set_leased_transitions(
+        has_lease_ ? lease_.transition_count : 0);
+    response->set_resident_transitions(resident_transitions_);
+    response->set_resident_envelopes(resident_by_envelope_.size());
     response->set_resident_estimated_bytes(resident_estimated_bytes_);
-    response->set_capacity_samples(config_.max_queue_samples);
-    response->set_capacity_fragments(config_.max_queue_fragments);
-    response->set_capacity_estimated_bytes(config_.max_queue_estimated_bytes);
+    response->set_capacity_transitions(config_.capacity_transitions);
+    response->set_capacity_bytes(config_.capacity_bytes);
     response->set_pressure_state(PressureStateLocked());
     response->set_redelivery_count(redelivery_count_);
     response->set_nack_count(nack_count_);
     response->set_expired_lease_count(expired_lease_count_);
-    response->set_latest_ack_at_unix_ms(latest_ack_unix_ms_);
+    if (latest_ack_unix_ms_ > 0) {
+        response->set_latest_ack_at_unix_ms(latest_ack_unix_ms_);
+    }
     response->set_target_hit_count(target_hit_count_);
-    response->set_partial_get_count(partial_get_count_);
+    response->set_draw_attempt_count(draw_attempt_count_);
+    response->set_drawn_transition_slot_count(
+        drawn_transition_slot_count_);
     response->set_empty_timeout_count(empty_timeout_count_);
     response->set_last_error(last_error_);
-    response->set_trained_sample_count(trained_sample_count_);
-    response->set_stale_sample_count(stale_sample_count_);
-    response->set_invalid_sample_count(invalid_sample_count_);
-    response->set_shutdown_untrained_sample_count(
-        shutdown_untrained_sample_count_);
+    response->set_trained_transition_count(trained_transition_count_);
+    response->set_invalid_transition_count(invalid_transition_count_);
+    response->set_shutdown_untrained_transition_count(
+        shutdown_untrained_transition_count_);
     response->set_lease_renew_count(lease_renew_count_);
     response->set_backend_type(
         rl::training::v1::SAMPLE_BACKEND_TYPE_LOCAL_MEMORY);
@@ -1409,78 +1210,51 @@ void SamplePoolCoordinator::FillStatusScalarsLocked(
     response->set_active_consumer_count(has_lease_ ? 1 : 0);
     response->set_consumer_busy_count(consumer_busy_count_);
     response->set_ingress_ready(!finalized_);
-    response->set_pool_ready(!finalized_);
-    response->set_evicted_sample_count(evicted_sample_count_);
-    response->set_evicted_fragment_count(evicted_fragment_count_);
-    response->set_finalized(finalized_);
-    response->set_finalization_id(finalization_id_);
-    response->set_finalized_at_unix_ms(finalized_at_unix_ms_);
-    response->set_finalized_sample_count(finalized_sample_count_);
-    response->set_finalized_fragment_count(finalized_fragment_count_);
-
-    const int64_t snapshot_time = NowMs();
-    response->set_timestamp_unix_ms(snapshot_time);
-    bool has_ready = false;
-    int64_t oldest_created_at = 0;
-    uint64_t minimum_step = 0;
-    uint64_t maximum_step = 0;
-    for (const auto& fragment : backend_->ready()) {
-        const int64_t created_at = fragment.batch.created_at_unix_ms();
-        const uint64_t step = fragment.batch.behavior_policy().model_step();
-        if (!has_ready) {
-            oldest_created_at = created_at;
-            minimum_step = maximum_step = step;
-            has_ready = true;
-        } else {
-            oldest_created_at = std::min(oldest_created_at, created_at);
-            minimum_step = std::min(minimum_step, step);
-            maximum_step = std::max(maximum_step, step);
+    response->set_pool_ready(ready_transitions_ > 0);
+    response->set_timestamp_unix_ms(NowMs());
+    if (!backend_->ready().empty()) {
+        const auto oldest = std::min_element(
+            backend_->ready().begin(), backend_->ready().end(),
+            [](const StoredTransition& left,
+               const StoredTransition& right) {
+                return left.insert_sequence < right.insert_sequence;
+            });
+        response->set_oldest_ready_transition_age_ms(
+            NowMs() - oldest->inserted_at_unix_ms);
+        uint64_t minimum_step = std::numeric_limits<uint64_t>::max();
+        uint64_t maximum_step = 0;
+        for (const auto& item : backend_->ready()) {
+            minimum_step = std::min(
+                minimum_step,
+                item.transition.behavior_policy().model_step());
+            maximum_step = std::max(
+                maximum_step,
+                item.transition.behavior_policy().model_step());
         }
-    }
-    if (has_ready) {
-        response->set_oldest_ready_sample_age_ms(
-            std::max<int64_t>(0, snapshot_time - oldest_created_at));
         response->set_minimum_ready_model_step(minimum_step);
         response->set_maximum_ready_model_step(maximum_step);
     }
-}
-
-void SamplePoolCoordinator::AppendBehaviorSteps(
-    const std::vector<PolicyCounters>& policy_snapshot,
-    rl::training::v1::SamplePoolStatusRsp* response) {
-    for (const auto& counters : policy_snapshot) {
-        auto* status = response->add_behavior_steps();
-        *status->mutable_behavior_policy() = counters.behavior_policy;
-        status->set_ready_samples(counters.ready_samples);
-        status->set_ready_fragments(counters.ready_fragments);
-        status->set_leased_samples(counters.leased_samples);
-        status->set_leased_fragments(counters.leased_fragments);
-        status->set_acked_samples(counters.acked_samples);
-        status->set_acked_fragments(counters.acked_fragments);
-        status->set_trained_samples(counters.trained_samples);
-        status->set_stale_samples(counters.stale_samples);
-        status->set_invalid_samples(counters.invalid_samples);
-        status->set_shutdown_untrained_samples(
-            counters.shutdown_untrained_samples);
+    response->set_evicted_transition_count(evicted_transition_count_);
+    response->set_evicted_envelope_count(evicted_envelope_count_);
+    response->set_unsampled_evicted_transition_count(
+        unsampled_evicted_transition_count_);
+    response->set_previously_drawn_evicted_transition_count(
+        previously_drawn_evicted_transition_count_);
+    response->set_finalized(finalized_);
+    response->set_finalization_id(finalization_id_);
+    if (finalized_at_unix_ms_ > 0) {
+        response->set_finalized_at_unix_ms(finalized_at_unix_ms_);
     }
+    response->set_finalized_transition_count(
+        finalized_transition_count_);
 }
 
 void SamplePoolCoordinator::GetStatus(
     const rl::training::v1::SamplePoolStatusReq&,
     rl::training::v1::SamplePoolStatusRsp* response) {
-    response->Clear();
-    std::vector<PolicyCounters> policy_snapshot;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        ReclaimExpiredLeaseLocked();
-        policy_snapshot.reserve(policy_counters_.size());
-        for (const auto& [key, counters] : policy_counters_) {
-            (void)key;
-            policy_snapshot.push_back(counters);
-        }
-        FillStatusScalarsLocked(response);
-    }
-    AppendBehaviorSteps(policy_snapshot, response);
+    std::unique_lock<std::mutex> lock(mutex_);
+    ReclaimExpiredLeaseLocked();
+    FillStatusScalarsLocked(response);
 }
 
 const std::string& SamplePoolCoordinator::instance_id() const {

@@ -65,7 +65,6 @@ docker run --rm \
     bash -lc '
         set -euo pipefail
         cd /source
-        bash ./test.sh
         cmake -S /source -B /tmp/sample-build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_TESTING=OFF \

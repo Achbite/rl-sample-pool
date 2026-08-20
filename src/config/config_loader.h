@@ -14,10 +14,10 @@ struct ContractConfig {
 
 struct SamplePoolConfig {
     int listen_port = 9100;
-    int64_t max_queue_samples = 262144;
-    int64_t max_queue_fragments = 4096;
-    int max_fragment_samples = 128;
-    int64_t max_queue_estimated_bytes = 536870912;
+    std::string backend_type = "local_memory";
+    int64_t capacity_transitions = 10240;
+    int64_t capacity_bytes = 536870912;
+    uint64_t sampling_seed = 0;
     int64_t max_dedup_entries = 1000000;
     double high_watermark_ratio = 0.8;
     int default_get_timeout_ms = 1000;
