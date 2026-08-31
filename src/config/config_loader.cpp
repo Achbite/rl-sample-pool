@@ -255,7 +255,7 @@ bool LoadSamplePoolConfig(const std::string& yaml_path,
         parsed.default_lease_timeout_ms <= 0 ||
         parsed.delivery_history_size <= 0 ||
         parsed.contract.package_name != "rl-contracts" ||
-        parsed.contract.package_version != "0.14.0" ||
+        parsed.contract.package_version != "0.15.0" ||
         !IsLowerSha256(parsed.contract.source_digest) ||
         !IsLowerSha256(parsed.contract.artifact_digest) ||
         parsed.contract.platform.empty() ||

@@ -12,7 +12,7 @@ bash ./test.sh
 
 `test.sh` 是本仓库的统一测试入口，并按显式清单运行当前开发校验。
 
-## 2. 构建 0.14.0 制品
+## 2. 构建 0.15.0 制品
 
 先生成 Contracts 制品，再从 clean Git 保存点执行：
 
@@ -24,7 +24,7 @@ bash build_artifact.sh
 构建脚本会编译并运行测试。输出：
 
 ```text
-../.workspace/artifacts/rl-sample-pool/0.14.0/<platform>/
+../.workspace/artifacts/rl-sample-pool/0.15.0/<platform>/
 ```
 
 ## 3. 装配到 Learner

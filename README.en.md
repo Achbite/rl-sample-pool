@@ -13,7 +13,7 @@ bash ./test.sh
 `test.sh` is the repository's unified test entrypoint and runs the current
 development checks from an explicit allowlist.
 
-## 2. Build the 0.14.0 artifact
+## 2. Build the 0.15.0 artifact
 
 Create the Contracts artifact first, then run the build from a clean Git savepoint:
 
@@ -25,7 +25,7 @@ bash build_artifact.sh
 The script compiles the service and runs its tests. Output:
 
 ```text
-../.workspace/artifacts/rl-sample-pool/0.14.0/<platform>/
+../.workspace/artifacts/rl-sample-pool/0.15.0/<platform>/
 ```
 
 ## 3. Stage it into Learner

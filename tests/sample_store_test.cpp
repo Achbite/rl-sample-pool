@@ -18,7 +18,7 @@ constexpr char kArtifactDigest[] =
     "2222222222222222222222222222222222222222222222222222222222222222";
 constexpr char kGeneratorIdentity[] =
     "3333333333333333333333333333333333333333333333333333333333333333";
-constexpr char kProfileDigest[] =
+constexpr char kTrainingContractDigest[] =
     "4444444444444444444444444444444444444444444444444444444444444444";
 
 void Require(bool condition, const std::string& message) {
@@ -75,37 +75,6 @@ void FillService(rl::common::v1::ServiceInstanceIdentity* identity,
     identity->set_lifecycle_epoch(1);
 }
 
-void FillContract(rl::common::v1::ContractIdentity* contract) {
-    contract->set_package_name("rl-contracts");
-    contract->set_package_version("0.14.0");
-    SetDigest(contract->mutable_source_digest(), kSourceDigest);
-    SetDigest(contract->mutable_artifact_digest(), kArtifactDigest);
-    contract->set_platform("linux/arm64");
-    contract->set_generator_identity(kGeneratorIdentity);
-}
-
-void FillSchema(rl::common::v1::SchemaIdentity* schema,
-                const std::string& schema_id,
-                char digest_character) {
-    schema->set_schema_id(schema_id);
-    schema->set_schema_version(1);
-    SetDigest(schema->mutable_canonical_digest(),
-              std::string(64, digest_character));
-}
-
-rl::training::v1::TrainingSemanticsIdentity MakeSemantics() {
-    rl::training::v1::TrainingSemanticsIdentity semantics;
-    semantics.set_training_contract_id("maze.training.v3");
-    FillSchema(semantics.mutable_observation_schema(),
-               "maze.observation.v3", '5');
-    FillSchema(semantics.mutable_action_schema(), "maze.action.v1", '6');
-    FillSchema(semantics.mutable_reward_schema(), "maze.reward.v4", '7');
-    semantics.set_policy_distribution_schema_id("categorical.logits.v1");
-    semantics.set_model_architecture_id("maze.mlp-17x64x64.v1");
-    SetDigest(semantics.mutable_semantics_digest(), std::string(64, '8'));
-    return semantics;
-}
-
 SamplePoolConfig MakeConfig() {
     SamplePoolConfig config;
     config.backend_type = "local_memory";
@@ -118,7 +87,7 @@ SamplePoolConfig MakeConfig() {
     config.default_lease_timeout_ms = 1000;
     config.delivery_history_size = 16;
     config.contract.package_name = "rl-contracts";
-    config.contract.package_version = "0.14.0";
+    config.contract.package_version = "0.15.0";
     config.contract.source_digest = kSourceDigest;
     config.contract.artifact_digest = kArtifactDigest;
     config.contract.platform = "linux/arm64";
@@ -126,63 +95,34 @@ SamplePoolConfig MakeConfig() {
     return config;
 }
 
-void FillBehaviorPolicy(rl::training::v1::BehaviorPolicyReference* policy) {
-    policy->set_model_lineage_id("lineage-fixed");
-    policy->set_model_step(3);
-    policy->set_distribution_schema_id("categorical.logits.v1");
-    SetDigest(policy->mutable_policy_spec_digest(), std::string(64, '9'));
-    SetDigest(policy->mutable_artifact_digest(), std::string(64, 'a'));
-    SetDigest(policy->mutable_manifest_digest(), std::string(64, 'b'));
+void FillBehaviorModel(rl::training::v1::ModelIdentity* model) {
+    model->set_model_lineage_id("lineage-fixed");
+    model->set_model_step(3);
+    SetDigest(model->mutable_artifact_digest(), std::string(64, 'a'));
+    SetDigest(model->mutable_manifest_digest(), std::string(64, 'b'));
 }
 
 rl::training::v1::ProcessedTransitionEnvelope MakeEnvelope() {
     rl::training::v1::ProcessedTransitionEnvelope envelope;
     envelope.set_envelope_id("envelope-fixed");
-    *envelope.mutable_training_semantics() = MakeSemantics();
     FillService(envelope.mutable_producer(),
                 "sample-distributor", "sample-distributor-fixed");
-    FillContract(envelope.mutable_contract());
-    envelope.set_created_at_unix_ms(1700000000000);
+    SetDigest(envelope.mutable_training_contract_digest(),
+              kTrainingContractDigest);
+    FillBehaviorModel(envelope.mutable_behavior_model());
 
     for (uint32_t index = 0; index < 2; ++index) {
-        auto* transition = envelope.add_transitions();
+        auto* transition = envelope.add_samples();
         transition->set_item_id("item-" + std::to_string(index));
-        transition->set_environment_session_id("environment-fixed");
-        transition->set_episode_id("episode-fixed");
-        transition->set_agent_id(1);
-        transition->set_segment_id("segment-fixed");
-        transition->set_transition_index(index);
-        transition->set_segment_transition_count(2);
-        transition->set_action_step(10 + index);
         transition->add_observation(static_cast<float>(index));
         transition->add_observation(0.25f);
-        transition->add_next_observation(static_cast<float>(index + 1));
-        transition->add_next_observation(0.5f);
         transition->set_action(static_cast<int32_t>(index + 2));
-        transition->set_reward(0.0f);
         transition->set_behavior_log_probability(-0.5f - index * 0.1f);
         transition->set_behavior_value(0.2f + index * 0.1f);
         transition->set_advantage(index == 0 ? 0.5f : -0.25f);
         transition->set_value_target(index == 0 ? 0.7f : 0.05f);
-        FillBehaviorPolicy(transition->mutable_behavior_policy());
-        SetDigest(transition->mutable_rollout_estimator_profile_digest(),
-                  kProfileDigest);
+        transition->set_behavior_model_step(3);
         transition->set_created_at_unix_ms(1700000000000 + index);
-
-        if (index == 0) {
-            transition->set_end_kind(
-                rl::training::v1::TRANSITION_END_KIND_CONTINUING);
-        } else {
-            transition->set_environment_terminal(true);
-            transition->set_end_kind(
-                rl::training::v1::
-                    TRANSITION_END_KIND_ENVIRONMENT_TERMINATED);
-            transition->set_segment_close_reason(
-                rl::training::v1::SEGMENT_CLOSE_REASON_GOAL);
-            transition->set_segment_boundary(true);
-            transition->set_bootstrap_applied(false);
-            transition->set_bootstrap_value(0.0f);
-        }
     }
 
     envelope.clear_payload_digest();
@@ -201,7 +141,9 @@ void TestPushGetAck() {
     rl::training::v1::PushSamplesRsp push_response;
     pool.Push(push_request, &push_response);
     Require(push_response.result() == rl::training::v1::PUSH_RESULT_ACCEPTED &&
-                push_response.accepted_transitions() == 2,
+                push_response.envelope_id() == envelope.envelope_id() &&
+                push_response.payload_digest().SerializeAsString() ==
+                    envelope.payload_digest().SerializeAsString(),
             "Push accepts the fixed processed-transition envelope");
 
     rl::training::v1::GetBatchReq get_request;
@@ -209,14 +151,13 @@ void TestPushGetAck() {
     get_request.set_timeout_ms(10);
     get_request.set_lease_timeout_ms(1000);
     FillService(get_request.mutable_consumer(), "learner", "learner-fixed");
-    *get_request.mutable_required_semantics() = MakeSemantics();
-    SetDigest(get_request.mutable_required_rollout_estimator_profile_digest(),
-              kProfileDigest);
+    SetDigest(get_request.mutable_required_training_contract_digest(),
+              kTrainingContractDigest);
     rl::training::v1::GetBatchRsp get_response;
     pool.GetBatch(get_request, &get_response, []() { return false; });
 
     std::map<std::string, std::string> expected_transitions;
-    for (const auto& transition : envelope.transitions()) {
+    for (const auto& transition : envelope.samples()) {
         expected_transitions.emplace(
             transition.item_id(), transition.SerializeAsString());
     }
@@ -228,7 +169,7 @@ void TestPushGetAck() {
     }
     Require(get_response.result() ==
                 rl::training::v1::GET_BATCH_RESULT_LEASED &&
-                get_response.returned_transitions() == 2 &&
+                get_response.items_size() == 2 &&
                 leased_transitions == expected_transitions,
             "Get leases the two fixed transitions unchanged and uniquely");
 
@@ -240,8 +181,7 @@ void TestPushGetAck() {
     rl::training::v1::DeliveryRsp ack_response;
     pool.Ack(ack_request, &ack_response);
     Require(ack_response.result() ==
-                rl::training::v1::DELIVERY_RESULT_APPLIED &&
-                ack_response.affected_transitions() == 2,
+                rl::training::v1::DELIVERY_RESULT_APPLIED,
             "Ack settles the leased fixed transitions as trained");
 
     rl::training::v1::SamplePoolStatusReq status_request;

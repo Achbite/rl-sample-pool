@@ -58,7 +58,6 @@ private:
         rl::training::v1::AckDisposition disposition =
             rl::training::v1::ACK_DISPOSITION_UNSPECIFIED;
         std::string train_update_id;
-        int64_t affected_transitions = 0;
     };
 
     static int64_t NowMs();
@@ -78,18 +77,8 @@ private:
         const rl::common::v1::ServiceInstanceIdentity& identity);
     static std::string ServiceKey(
         const rl::common::v1::ServiceInstanceIdentity& identity);
-    static bool IsBehaviorPolicyReferenceValid(
-        const rl::training::v1::BehaviorPolicyReference& identity);
-    static bool IsSchemaIdentityValid(
-        const rl::common::v1::SchemaIdentity& identity);
-    static std::string SemanticsKey(
-        const rl::training::v1::TrainingSemanticsIdentity& semantics);
-
-    bool ContractMatchesConfig(
-        const rl::common::v1::ContractIdentity& contract) const;
-    bool ValidateSemantics(
-        const rl::training::v1::TrainingSemanticsIdentity& semantics,
-        std::string* error) const;
+    static bool IsModelIdentityValid(
+        const rl::training::v1::ModelIdentity& identity);
     bool ValidateEnvelopeLocked(
         const rl::training::v1::ProcessedTransitionEnvelope& envelope,
         std::string* error,
@@ -116,16 +105,13 @@ private:
         const EnvelopeFingerprint& fingerprint);
     const DeliveryRecord* DeliveryHistoryLocked(
         const std::string& delivery_id) const;
-    void FillDeliveryResponseLocked(
-        rl::training::v1::DeliveryRsp* response) const;
     void FillFinalizeResponseLocked(
         rl::training::v1::FinalizeSamplePoolRsp* response) const;
 
     void FillStatusScalarsLocked(
         rl::training::v1::SamplePoolStatusRsp* response) const;
     int64_t EligibleReadyCountLocked(
-        const std::string& semantics_key,
-        const std::string& profile_digest_hex) const;
+        const std::string& training_contract_digest_hex) const;
     void RemoveResidentItemLocked(const StoredTransition& item);
 
     SamplePoolConfig config_;
