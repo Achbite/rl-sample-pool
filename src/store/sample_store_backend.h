@@ -20,10 +20,8 @@ struct EnvelopeFingerprint {
 
 struct StoredTransition {
     rl::training::v1::ProcessedTransition transition;
-    rl::training::v1::TrainingSemanticsIdentity training_semantics;
     std::string envelope_id;
-    std::string semantics_key;
-    std::string profile_digest_hex;
+    std::string training_contract_digest_hex;
     uint64_t insert_sequence = 0;
     int64_t inserted_at_unix_ms = 0;
     int64_t estimated_bytes = 0;
@@ -45,8 +43,7 @@ public:
     virtual std::vector<StoredTransition> ExtractAllReady() = 0;
     virtual std::vector<StoredTransition> DrawUniformWithoutReplacement(
         size_t count,
-        const std::string& semantics_key,
-        const std::string& profile_digest_hex,
+        const std::string& training_contract_digest_hex,
         std::mt19937_64* generator) = 0;
 };
 
@@ -60,8 +57,7 @@ public:
     std::vector<StoredTransition> ExtractAllReady() override;
     std::vector<StoredTransition> DrawUniformWithoutReplacement(
         size_t count,
-        const std::string& semantics_key,
-        const std::string& profile_digest_hex,
+        const std::string& training_contract_digest_hex,
         std::mt19937_64* generator) override;
 
 private:

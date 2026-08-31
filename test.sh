@@ -19,8 +19,6 @@ fi
 test_build_dir="$(mktemp -d "${TMPDIR:-/tmp}/rl-sample-pool-test.XXXXXX")"
 trap 'rm -rf "${test_build_dir}"' EXIT
 
-# TCR-A3-DEVELOPMENT-VALIDATION-008: this is the only approved SamplePool
-# development-validation case.
 cmake -S "${repo_dir}" -B "${test_build_dir}" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_TESTING=ON \
