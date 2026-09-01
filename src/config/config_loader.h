@@ -6,10 +6,7 @@
 struct ContractConfig {
     std::string package_name;
     std::string package_version;
-    std::string source_digest;
-    std::string artifact_digest;
     std::string platform;
-    std::string generator_identity;
 };
 
 struct SamplePoolConfig {

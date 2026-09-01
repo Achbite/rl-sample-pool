@@ -12,12 +12,6 @@
 
 namespace {
 
-constexpr char kSourceDigest[] =
-    "1111111111111111111111111111111111111111111111111111111111111111";
-constexpr char kArtifactDigest[] =
-    "2222222222222222222222222222222222222222222222222222222222222222";
-constexpr char kGeneratorIdentity[] =
-    "3333333333333333333333333333333333333333333333333333333333333333";
 constexpr char kTrainingContractDigest[] =
     "4444444444444444444444444444444444444444444444444444444444444444";
 
@@ -88,10 +82,7 @@ SamplePoolConfig MakeConfig() {
     config.delivery_history_size = 16;
     config.contract.package_name = "rl-contracts";
     config.contract.package_version = "0.15.0";
-    config.contract.source_digest = kSourceDigest;
-    config.contract.artifact_digest = kArtifactDigest;
     config.contract.platform = "linux/arm64";
-    config.contract.generator_identity = kGeneratorIdentity;
     return config;
 }
 
@@ -123,6 +114,9 @@ rl::training::v1::ProcessedTransitionEnvelope MakeEnvelope() {
         transition->set_value_target(index == 0 ? 0.7f : 0.05f);
         transition->set_behavior_model_step(3);
         transition->set_created_at_unix_ms(1700000000000 + index);
+        for (uint32_t action = 0; action < index + 2; ++action) {
+            transition->add_action_mask(action != index);
+        }
     }
 
     envelope.clear_payload_digest();

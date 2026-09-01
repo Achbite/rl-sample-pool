@@ -19,7 +19,7 @@ set(SOURCES
 
 set(CONTRACT_CPP_DIR "" CACHE PATH "Directory containing generated C++ bindings")
 if(NOT CONTRACT_CPP_DIR)
-    message(FATAL_ERROR "CONTRACT_CPP_DIR must point to an rl-contracts C++ artifact")
+    message(FATAL_ERROR "CONTRACT_CPP_DIR must point to an rl-training-contracts C++ artifact")
 endif()
 
 set(PROTO_GEN_DIR ${CONTRACT_CPP_DIR})
