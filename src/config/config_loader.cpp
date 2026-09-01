@@ -113,17 +113,6 @@ bool ParseDouble(const std::string& value, double* output) {
     }
 }
 
-bool IsLowerSha256(const std::string& value) {
-    if (value.size() != 64) return false;
-    for (char character : value) {
-        if (!((character >= '0' && character <= '9') ||
-              (character >= 'a' && character <= 'f'))) {
-            return false;
-        }
-    }
-    return true;
-}
-
 bool IsAllowedEntry(const YamlEntry& entry) {
     static const std::set<std::string> allowed = {
         "server.listen_port",
@@ -140,10 +129,7 @@ bool IsAllowedEntry(const YamlEntry& entry) {
         "queue.delivery_history_size",
         "contract.package_name",
         "contract.package_version",
-        "contract.source_digest",
-        "contract.artifact_digest",
         "contract.platform",
-        "contract.generator_identity",
     };
     return allowed.count(entry.section + "." + entry.key) == 1;
 }
@@ -208,18 +194,13 @@ bool LoadSamplePoolConfig(const std::string& yaml_path,
     const std::string* package_name = required("contract", "package_name");
     const std::string* package_version =
         required("contract", "package_version");
-    const std::string* source_digest = required("contract", "source_digest");
-    const std::string* artifact_digest =
-        required("contract", "artifact_digest");
     const std::string* platform = required("contract", "platform");
-    const std::string* generator =
-        required("contract", "generator_identity");
     if (!listen_port || !backend_type || !capacity_transitions ||
         !capacity_bytes || !sampling_seed || !sampling_strategy ||
         !eviction_strategy ||
         !max_dedup || !high_watermark || !get_timeout || !lease_timeout ||
         !delivery_history || !package_name || !package_version ||
-        !source_digest || !artifact_digest || !platform || !generator) {
+        !platform) {
         return false;
     }
     if (!ParseInteger(*listen_port, &parsed.listen_port) ||
@@ -238,10 +219,7 @@ bool LoadSamplePoolConfig(const std::string& yaml_path,
     parsed.backend_type = *backend_type;
     parsed.contract.package_name = *package_name;
     parsed.contract.package_version = *package_version;
-    parsed.contract.source_digest = *source_digest;
-    parsed.contract.artifact_digest = *artifact_digest;
     parsed.contract.platform = *platform;
-    parsed.contract.generator_identity = *generator;
     if (parsed.listen_port <= 0 || parsed.listen_port > 65535 ||
         parsed.backend_type != "local_memory" ||
         parsed.capacity_transitions <= 0 || parsed.capacity_bytes <= 0 ||
@@ -256,10 +234,7 @@ bool LoadSamplePoolConfig(const std::string& yaml_path,
         parsed.delivery_history_size <= 0 ||
         parsed.contract.package_name != "rl-contracts" ||
         parsed.contract.package_version != "0.15.0" ||
-        !IsLowerSha256(parsed.contract.source_digest) ||
-        !IsLowerSha256(parsed.contract.artifact_digest) ||
-        parsed.contract.platform.empty() ||
-        !IsLowerSha256(parsed.contract.generator_identity)) {
+        parsed.contract.platform.empty()) {
         std::cerr << "[SamplePool] config value is outside the locked contract"
                   << std::endl;
         return false;

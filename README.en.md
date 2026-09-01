@@ -15,14 +15,16 @@ development checks from an explicit allowlist.
 
 ## 2. Build the 0.15.0 artifact
 
-Create the Contracts artifact first, then run the build from a clean Git savepoint:
+Create the task-neutral training-contract artifact first, then build from the
+current source:
 
 ```bash
-(cd ../rl-contracts && bash build_artifact.sh)
+(cd ../rl-contracts && bash build_artifact.sh training)
 bash build_artifact.sh
 ```
 
-The script compiles the service and runs its tests. Output:
+The artifact script only compiles the production binary. Tests remain an explicit
+`bash ./test.sh` operation from section 1. Output:
 
 ```text
 ../.workspace/artifacts/rl-sample-pool/0.15.0/<platform>/
@@ -30,11 +32,14 @@ The script compiles the service and runs its tests. Output:
 
 ## 3. Stage it into Learner
 
-Do not copy the binary manually. Use the Learner sync entry point:
+Prefer the Learner sync entrypoint to copy the complete artifact:
 
 ```bash
 (cd ../rl-learner && bash scripts/sync_runtime_artifacts.sh)
 ```
+
+For development artifacts, Learner's `make deps` builds and stages both required
+binaries. `make shell` never performs that synchronization implicitly.
 
 ## 4. Run it directly
 
@@ -43,7 +48,9 @@ draw samples READY items uniformly without replacement; TRAINED ACK deletes
 them, NACK restores READY, and capacity pressure evicts only the oldest READY
 items in FIFO order. Behavior `model_step` is provenance rather than a stale
 admission gate, and producer envelopes, GAE segments, and Learner batches remain
-distinct units.
+distinct units. `action_mask` is stored and delivered unchanged like every other
+sample field. Sample Pool does not interpret task action semantics or require masks
+to be enabled.
 
 ```bash
 # When build/maze_sample_pool already exists

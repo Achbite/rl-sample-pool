@@ -304,15 +304,7 @@ void SamplePoolCoordinator::FillContractIdentity(
     rl::common::v1::ContractIdentity* identity) const {
     identity->set_package_name(config_.contract.package_name);
     identity->set_package_version(config_.contract.package_version);
-    identity->mutable_source_digest()->set_algorithm(
-        rl::common::v1::DIGEST_ALGORITHM_SHA256);
-    identity->mutable_source_digest()->set_hex(config_.contract.source_digest);
-    identity->mutable_artifact_digest()->set_algorithm(
-        rl::common::v1::DIGEST_ALGORITHM_SHA256);
-    identity->mutable_artifact_digest()->set_hex(
-        config_.contract.artifact_digest);
     identity->set_platform(config_.contract.platform);
-    identity->set_generator_identity(config_.contract.generator_identity);
 }
 
 void SamplePoolCoordinator::RequeueLeaseLocked(bool expired) {
