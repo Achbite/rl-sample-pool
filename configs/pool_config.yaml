@@ -16,15 +16,8 @@ eviction:
   strategy: fifo_ready
 
 queue:
-  max_dedup_entries: 1000000  # bounded terminal UID/digest retry history
+  max_dedup_entries: 1000000  # bounded accepted object-ID retry history
   high_watermark_ratio: 0.8
   default_get_timeout_ms: 1000
   default_lease_timeout_ms: 10000
   delivery_history_size: 4096
-
-# Runtime contract selection. Build provenance is intentionally not part of
-# the startup contract; the package version and platform select the bindings.
-contract:
-  package_name: rl-contracts
-  package_version: 0.15.0
-  platform: linux/arm64

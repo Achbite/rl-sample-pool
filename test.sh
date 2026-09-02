@@ -27,4 +27,4 @@ cmake --build "${test_build_dir}" --parallel \
     --target sample_pool_development_test
 ctest --test-dir "${test_build_dir}" \
     --output-on-failure \
-    -R '^sample_pool_development_contract$'
+    -R '^sample_pool_data_path$'

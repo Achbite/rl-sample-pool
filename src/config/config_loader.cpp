@@ -127,9 +127,6 @@ bool IsAllowedEntry(const YamlEntry& entry) {
         "queue.default_get_timeout_ms",
         "queue.default_lease_timeout_ms",
         "queue.delivery_history_size",
-        "contract.package_name",
-        "contract.package_version",
-        "contract.platform",
     };
     return allowed.count(entry.section + "." + entry.key) == 1;
 }
@@ -191,16 +188,11 @@ bool LoadSamplePoolConfig(const std::string& yaml_path,
         required("queue", "default_lease_timeout_ms");
     const std::string* delivery_history =
         required("queue", "delivery_history_size");
-    const std::string* package_name = required("contract", "package_name");
-    const std::string* package_version =
-        required("contract", "package_version");
-    const std::string* platform = required("contract", "platform");
     if (!listen_port || !backend_type || !capacity_transitions ||
         !capacity_bytes || !sampling_seed || !sampling_strategy ||
         !eviction_strategy ||
         !max_dedup || !high_watermark || !get_timeout || !lease_timeout ||
-        !delivery_history || !package_name || !package_version ||
-        !platform) {
+        !delivery_history) {
         return false;
     }
     if (!ParseInteger(*listen_port, &parsed.listen_port) ||
@@ -217,9 +209,6 @@ bool LoadSamplePoolConfig(const std::string& yaml_path,
         return false;
     }
     parsed.backend_type = *backend_type;
-    parsed.contract.package_name = *package_name;
-    parsed.contract.package_version = *package_version;
-    parsed.contract.platform = *platform;
     if (parsed.listen_port <= 0 || parsed.listen_port > 65535 ||
         parsed.backend_type != "local_memory" ||
         parsed.capacity_transitions <= 0 || parsed.capacity_bytes <= 0 ||
@@ -231,11 +220,8 @@ bool LoadSamplePoolConfig(const std::string& yaml_path,
         !std::isfinite(parsed.high_watermark_ratio) ||
         parsed.default_get_timeout_ms <= 0 ||
         parsed.default_lease_timeout_ms <= 0 ||
-        parsed.delivery_history_size <= 0 ||
-        parsed.contract.package_name != "rl-contracts" ||
-        parsed.contract.package_version != "0.15.0" ||
-        parsed.contract.platform.empty()) {
-        std::cerr << "[SamplePool] config value is outside the locked contract"
+        parsed.delivery_history_size <= 0) {
+        std::cerr << "[SamplePool] config value is invalid"
                   << std::endl;
         return false;
     }
