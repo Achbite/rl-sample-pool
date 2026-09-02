@@ -16,6 +16,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 class SamplePoolCoordinator {
@@ -64,15 +65,6 @@ private:
     static std::string CreateInstanceId(const std::string& prefix);
     static int64_t EstimateBytes(
         const rl::training::v1::ProcessedTransition& transition);
-    static std::string DeterministicSerialize(
-        const rl::training::v1::ProcessedTransitionEnvelope& envelope,
-        bool clear_payload_digest);
-    static std::string Sha256Hex(const std::string& data);
-    static EnvelopeFingerprint FingerprintEnvelope(
-        const rl::training::v1::ProcessedTransitionEnvelope& envelope);
-    static std::string FingerprintTransition(
-        const rl::training::v1::ProcessedTransition& transition);
-    static bool IsSha256(const rl::common::v1::ContentDigest& digest);
     static bool IsServiceIdentityValid(
         const rl::common::v1::ServiceInstanceIdentity& identity);
     static std::string ServiceKey(
@@ -81,8 +73,7 @@ private:
         const rl::training::v1::ModelIdentity& identity);
     bool ValidateEnvelopeLocked(
         const rl::training::v1::ProcessedTransitionEnvelope& envelope,
-        std::string* error,
-        rl::training::v1::PushResult* rejection) const;
+        std::string* error) const;
     bool DeliveryBelongsToInstanceLocked(const std::string& delivery_id) const;
     bool CapacityAllowsLocked(int64_t transitions,
                               int64_t estimated_bytes) const;
@@ -94,15 +85,11 @@ private:
 
     void FillServiceIdentity(
         rl::common::v1::ServiceInstanceIdentity* identity) const;
-    void FillContractIdentity(
-        rl::common::v1::ContractIdentity* identity) const;
     void ReclaimExpiredLeaseLocked();
     void RequeueLeaseLocked(bool expired);
     void RememberDeliveryLocked(const std::string& delivery_id,
                                 const DeliveryRecord& record);
-    void RememberCompletedEnvelopeLocked(
-        const std::string& envelope_id,
-        const EnvelopeFingerprint& fingerprint);
+    void RememberCompletedEnvelopeLocked(const std::string& envelope_id);
     const DeliveryRecord* DeliveryHistoryLocked(
         const std::string& delivery_id) const;
     void FillFinalizeResponseLocked(
@@ -110,8 +97,6 @@ private:
 
     void FillStatusScalarsLocked(
         rl::training::v1::SamplePoolStatusRsp* response) const;
-    int64_t EligibleReadyCountLocked(
-        const std::string& training_contract_digest_hex) const;
     void RemoveResidentItemLocked(const StoredTransition& item);
 
     SamplePoolConfig config_;
@@ -124,10 +109,9 @@ private:
     bool has_lease_ = false;
     Lease lease_;
 
-    std::unordered_map<std::string, EnvelopeFingerprint>
-        completed_envelope_fingerprints_;
+    std::unordered_set<std::string> completed_envelope_ids_;
     std::deque<std::string> completed_envelope_order_;
-    std::unordered_map<std::string, std::string> seen_item_fingerprints_;
+    std::unordered_set<std::string> seen_item_ids_;
     std::deque<std::string> seen_item_order_;
     std::set<std::string> resident_item_ids_;
     std::unordered_map<std::string, DeliveryRecord> delivery_history_;

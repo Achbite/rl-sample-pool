@@ -1,13 +1,9 @@
 #include "store/sample_pool_coordinator.h"
 
-#include <google/protobuf/io/coded_stream.h>
-#include <google/protobuf/io/zero_copy_stream_impl_lite.h>
-#include <openssl/sha.h>
-
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
-#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <set>
@@ -16,19 +12,6 @@
 #include <utility>
 
 namespace {
-
-template <typename Message>
-std::string DeterministicBytes(const Message& message) {
-    std::string output;
-    output.reserve(static_cast<size_t>(message.ByteSizeLong()));
-    google::protobuf::io::StringOutputStream stream(&output);
-    google::protobuf::io::CodedOutputStream coded(&stream);
-    coded.SetSerializationDeterministic(true);
-    if (!message.SerializeToCodedStream(&coded) || coded.HadError()) {
-        throw std::runtime_error("deterministic protobuf serialization failed");
-    }
-    return output;
-}
 
 bool Finite(float value) {
     return std::isfinite(static_cast<double>(value));
@@ -57,9 +40,9 @@ std::string SamplePoolCoordinator::CreateInstanceId(
     const auto now = std::chrono::high_resolution_clock::now()
                          .time_since_epoch()
                          .count();
+    static std::atomic<uint64_t> sequence{0};
     std::ostringstream output;
-    output << prefix << "-" << now << "-" << std::hex
-           << std::hash<std::string>{}(prefix + std::to_string(now));
+    output << prefix << "-" << now << "-" << sequence.fetch_add(1);
     return output.str();
 }
 
@@ -70,48 +53,6 @@ int64_t SamplePoolCoordinator::EstimateBytes(
         throw std::overflow_error("processed transition size exceeds int64");
     }
     return static_cast<int64_t>(bytes);
-}
-
-std::string SamplePoolCoordinator::DeterministicSerialize(
-    const rl::training::v1::ProcessedTransitionEnvelope& envelope,
-    bool clear_payload_digest) {
-    rl::training::v1::ProcessedTransitionEnvelope copy(envelope);
-    if (clear_payload_digest) copy.clear_payload_digest();
-    return DeterministicBytes(copy);
-}
-
-std::string SamplePoolCoordinator::Sha256Hex(const std::string& data) {
-    unsigned char digest[SHA256_DIGEST_LENGTH];
-    SHA256(reinterpret_cast<const unsigned char*>(data.data()),
-           data.size(), digest);
-    std::ostringstream output;
-    output << std::hex << std::setfill('0');
-    for (unsigned char byte : digest) {
-        output << std::setw(2) << static_cast<int>(byte);
-    }
-    return output.str();
-}
-
-EnvelopeFingerprint SamplePoolCoordinator::FingerprintEnvelope(
-    const rl::training::v1::ProcessedTransitionEnvelope& envelope) {
-    const std::string bytes = DeterministicSerialize(envelope, true);
-    return {Sha256Hex(bytes), static_cast<uint64_t>(bytes.size())};
-}
-
-std::string SamplePoolCoordinator::FingerprintTransition(
-    const rl::training::v1::ProcessedTransition& transition) {
-    return Sha256Hex(DeterministicBytes(transition));
-}
-
-bool SamplePoolCoordinator::IsSha256(
-    const rl::common::v1::ContentDigest& digest) {
-    if (digest.algorithm() != rl::common::v1::DIGEST_ALGORITHM_SHA256 ||
-        digest.hex().size() != 64) {
-        return false;
-    }
-    return std::all_of(digest.hex().begin(), digest.hex().end(), [](char c) {
-        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-    });
 }
 
 bool SamplePoolCoordinator::IsServiceIdentityValid(
@@ -128,47 +69,22 @@ std::string SamplePoolCoordinator::ServiceKey(
 
 bool SamplePoolCoordinator::IsModelIdentityValid(
     const rl::training::v1::ModelIdentity& identity) {
-    return !identity.model_lineage_id().empty() && identity.has_model_step() &&
-           IsSha256(identity.artifact_digest()) &&
-           IsSha256(identity.manifest_digest());
+    return !identity.model_lineage_id().empty() && identity.has_model_step();
 }
 
 bool SamplePoolCoordinator::ValidateEnvelopeLocked(
     const rl::training::v1::ProcessedTransitionEnvelope& envelope,
-    std::string* error,
-    rl::training::v1::PushResult* rejection) const {
-    *rejection = rl::training::v1::PUSH_RESULT_REJECTED_INVALID;
+    std::string* error) const {
     if (envelope.envelope_id().empty() || envelope.samples_size() <= 0) {
         *error = "envelope identity or samples are missing";
         return false;
     }
-    if (!IsServiceIdentityValid(envelope.producer()) ||
-        envelope.producer().component() != "sample-distributor") {
-        *rejection = rl::training::v1::PUSH_RESULT_REJECTED_IDENTITY;
-        *error = "producer must be a concrete sample-distributor instance";
+    if (!IsServiceIdentityValid(envelope.producer())) {
+        *error = "producer instance identity is incomplete";
         return false;
     }
-    if (!IsSha256(envelope.training_contract_digest()) ||
-        !IsModelIdentityValid(envelope.behavior_model())) {
-        *rejection = rl::training::v1::PUSH_RESULT_REJECTED_IDENTITY;
-        *error = "training contract digest or behavior model is invalid";
-        return false;
-    }
-    if (!IsSha256(envelope.payload_digest())) {
-        *error = "envelope payload digest is invalid";
-        return false;
-    }
-
-    EnvelopeFingerprint fingerprint;
-    try {
-        fingerprint = FingerprintEnvelope(envelope);
-    } catch (const std::exception& exception) {
-        *error = exception.what();
-        return false;
-    }
-    if (fingerprint.payload_sha256 != envelope.payload_digest().hex()) {
-        *rejection = rl::training::v1::PUSH_RESULT_REJECTED_CONFLICT;
-        *error = "envelope payload digest mismatch";
+    if (!IsModelIdentityValid(envelope.behavior_model())) {
+        *error = "behavior model object identity is incomplete";
         return false;
     }
 
@@ -300,13 +216,6 @@ void SamplePoolCoordinator::FillServiceIdentity(
     identity->set_lifecycle_epoch(1);
 }
 
-void SamplePoolCoordinator::FillContractIdentity(
-    rl::common::v1::ContractIdentity* identity) const {
-    identity->set_package_name(config_.contract.package_name);
-    identity->set_package_version(config_.contract.package_version);
-    identity->set_platform(config_.contract.platform);
-}
-
 void SamplePoolCoordinator::RequeueLeaseLocked(bool expired) {
     if (!has_lease_) return;
     const int64_t count = lease_.transition_count;
@@ -342,14 +251,12 @@ void SamplePoolCoordinator::RememberDeliveryLocked(
 }
 
 void SamplePoolCoordinator::RememberCompletedEnvelopeLocked(
-    const std::string& envelope_id,
-    const EnvelopeFingerprint& fingerprint) {
-    completed_envelope_fingerprints_[envelope_id] = fingerprint;
+    const std::string& envelope_id) {
+    completed_envelope_ids_.insert(envelope_id);
     completed_envelope_order_.push_back(envelope_id);
     while (completed_envelope_order_.size() >
            static_cast<size_t>(config_.max_dedup_entries)) {
-        completed_envelope_fingerprints_.erase(
-            completed_envelope_order_.front());
+        completed_envelope_ids_.erase(completed_envelope_order_.front());
         completed_envelope_order_.pop_front();
     }
 }
@@ -368,16 +275,6 @@ void SamplePoolCoordinator::FillFinalizeResponseLocked(
     if (finalized_at_unix_ms_ > 0) {
         response->set_finalized_at_unix_ms(finalized_at_unix_ms_);
     }
-}
-
-int64_t SamplePoolCoordinator::EligibleReadyCountLocked(
-    const std::string& training_contract_digest_hex) const {
-    return static_cast<int64_t>(std::count_if(
-        backend_->ready().begin(), backend_->ready().end(),
-        [&](const StoredTransition& item) {
-            return item.training_contract_digest_hex ==
-                   training_contract_digest_hex;
-        }));
 }
 
 void SamplePoolCoordinator::Push(
@@ -403,69 +300,38 @@ void SamplePoolCoordinator::Push(
     }
 
     std::string error;
-    auto rejection = rl::training::v1::PUSH_RESULT_REJECTED_INVALID;
-    if (!ValidateEnvelopeLocked(envelope, &error, &rejection)) {
+    if (!ValidateEnvelopeLocked(envelope, &error)) {
         ++rejected_push_attempt_count_;
         rejected_transition_attempts_ += attempted;
         last_error_ = error;
-        response->set_result(rejection);
+        response->set_result(
+            rl::training::v1::PUSH_RESULT_REJECTED_INVALID);
         response->set_message(error);
         response->set_pressure_state(PressureStateLocked());
         return;
     }
 
-    const EnvelopeFingerprint envelope_fingerprint =
-        FingerprintEnvelope(envelope);
-    const auto existing_envelope =
-        completed_envelope_fingerprints_.find(envelope.envelope_id());
-    if (existing_envelope != completed_envelope_fingerprints_.end()) {
-        if (existing_envelope->second == envelope_fingerprint) {
-            ++duplicate_push_attempt_count_;
-            duplicate_transition_attempts_ += attempted;
-            response->set_result(rl::training::v1::PUSH_RESULT_DUPLICATE);
-            response->set_message("envelope already accepted");
-            response->mutable_payload_digest()->CopyFrom(
-                envelope.payload_digest());
-        } else {
-            ++rejected_push_attempt_count_;
-            rejected_transition_attempts_ += attempted;
-            last_error_ = "envelope identity reused with different bytes";
-            response->set_result(
-                rl::training::v1::PUSH_RESULT_REJECTED_CONFLICT);
-            response->set_message(last_error_);
-        }
+    if (completed_envelope_ids_.count(envelope.envelope_id()) > 0) {
+        ++duplicate_push_attempt_count_;
+        duplicate_transition_attempts_ += attempted;
+        response->set_result(rl::training::v1::PUSH_RESULT_DUPLICATE);
+        response->set_message("envelope object already accepted");
         response->set_pressure_state(PressureStateLocked());
         return;
     }
 
     int existing_item_count = 0;
     for (const auto& transition : envelope.samples()) {
-        const auto existing =
-            seen_item_fingerprints_.find(transition.item_id());
-        if (existing == seen_item_fingerprints_.end()) continue;
+        if (seen_item_ids_.count(transition.item_id()) == 0) continue;
         ++existing_item_count;
-        if (existing->second != FingerprintTransition(transition)) {
-            ++rejected_push_attempt_count_;
-            rejected_transition_attempts_ += attempted;
-            last_error_ =
-                "item identity reused with different processed transition";
-            response->set_result(
-                rl::training::v1::PUSH_RESULT_REJECTED_CONFLICT);
-            response->set_message(last_error_);
-            response->set_pressure_state(PressureStateLocked());
-            return;
-        }
     }
     if (existing_item_count > 0) {
         if (existing_item_count == attempted) {
             ++duplicate_push_attempt_count_;
             duplicate_transition_attempts_ += attempted;
-            RememberCompletedEnvelopeLocked(
-                envelope.envelope_id(), envelope_fingerprint);
+            RememberCompletedEnvelopeLocked(envelope.envelope_id());
             response->set_result(rl::training::v1::PUSH_RESULT_DUPLICATE);
             response->set_message("all envelope items were already accepted");
-            response->mutable_payload_digest()->CopyFrom(
-                envelope.payload_digest());
         } else {
             ++rejected_push_attempt_count_;
             rejected_transition_attempts_ += attempted;
@@ -516,8 +382,6 @@ void SamplePoolCoordinator::Push(
         StoredTransition stored;
         stored.transition = transition;
         stored.envelope_id = envelope.envelope_id();
-        stored.training_contract_digest_hex =
-            envelope.training_contract_digest().hex();
         stored.insert_sequence = next_insert_sequence_++;
         stored.inserted_at_unix_ms = inserted_at;
         stored.estimated_bytes = EstimateBytes(transition);
@@ -527,16 +391,14 @@ void SamplePoolCoordinator::Push(
         ready_estimated_bytes_ += EstimateBytes(transition);
         resident_estimated_bytes_ += EstimateBytes(transition);
         resident_item_ids_.insert(transition.item_id());
-        seen_item_fingerprints_[transition.item_id()] =
-            FingerprintTransition(transition);
+        seen_item_ids_.insert(transition.item_id());
         seen_item_order_.push_back(transition.item_id());
     }
     resident_by_envelope_[envelope.envelope_id()] += attempted;
-    RememberCompletedEnvelopeLocked(
-        envelope.envelope_id(), envelope_fingerprint);
+    RememberCompletedEnvelopeLocked(envelope.envelope_id());
 
     size_t examined = seen_item_order_.size();
-    while (seen_item_fingerprints_.size() >
+    while (seen_item_ids_.size() >
                static_cast<size_t>(config_.max_dedup_entries) &&
            examined-- > 0) {
         const std::string item_id = seen_item_order_.front();
@@ -544,7 +406,7 @@ void SamplePoolCoordinator::Push(
         if (resident_item_ids_.count(item_id) > 0) {
             seen_item_order_.push_back(item_id);
         } else {
-            seen_item_fingerprints_.erase(item_id);
+            seen_item_ids_.erase(item_id);
         }
     }
 
@@ -553,7 +415,6 @@ void SamplePoolCoordinator::Push(
     response->set_result(rl::training::v1::PUSH_RESULT_ACCEPTED);
     response->set_message("accepted");
     response->set_pressure_state(PressureStateLocked());
-    response->mutable_payload_digest()->CopyFrom(envelope.payload_digest());
     cv_.notify_all();
 }
 
@@ -568,16 +429,13 @@ void SamplePoolCoordinator::GetBatch(
 
     if (request.requested_transitions() <= 0 ||
         request.timeout_ms() <= 0 || request.lease_timeout_ms() <= 0 ||
-        !IsServiceIdentityValid(request.consumer()) ||
-        !IsSha256(request.required_training_contract_digest())) {
+        !IsServiceIdentityValid(request.consumer())) {
         response->set_result(rl::training::v1::GET_BATCH_RESULT_REJECTED);
         response->set_message("draw request is invalid");
         return;
     }
 
     const std::string consumer_key = ServiceKey(request.consumer());
-    const std::string training_contract_digest =
-        request.required_training_contract_digest().hex();
     ++draw_attempt_count_;
     const auto timeout =
         std::chrono::milliseconds(request.timeout_ms());
@@ -591,8 +449,7 @@ void SamplePoolCoordinator::GetBatch(
             response->set_message("single consumer lease is active");
             return;
         }
-        if (EligibleReadyCountLocked(training_contract_digest) >=
-            request.requested_transitions()) {
+        if (ready_transitions_ >= request.requested_transitions()) {
             break;
         }
         if (is_cancelled() || std::chrono::steady_clock::now() >= deadline) {
@@ -606,8 +463,7 @@ void SamplePoolCoordinator::GetBatch(
 
     std::vector<StoredTransition> selected =
         backend_->DrawUniformWithoutReplacement(
-            static_cast<size_t>(request.requested_transitions()),
-            training_contract_digest, &random_);
+            static_cast<size_t>(request.requested_transitions()), &random_);
     const int64_t leased_at = NowMs();
     const int64_t lease_timeout_ms = request.lease_timeout_ms();
     lease_.delivery_id = instance_id_ + "/delivery-" +
@@ -809,12 +665,11 @@ void SamplePoolCoordinator::FinalizeSamplePool(
     const std::string consumer_key = ServiceKey(request.consumer());
     if (!IsServiceIdentityValid(request.consumer()) ||
         request.finalization_id().empty() ||
-        request.expected_sample_pool().component() != "sample-pool" ||
         request.expected_sample_pool().instance_id() != instance_id_ ||
         request.expected_sample_pool().lifecycle_epoch() != 1) {
         response->set_result(
-            rl::training::v1::SAMPLE_POOL_FINALIZE_RESULT_REJECTED_IDENTITY);
-        response->set_message("finalization identity is invalid");
+            rl::training::v1::SAMPLE_POOL_FINALIZE_RESULT_REJECTED_CONFLICT);
+        response->set_message("finalization target or consumer is invalid");
         FillFinalizeResponseLocked(response);
         return;
     }
@@ -861,7 +716,6 @@ void SamplePoolCoordinator::FinalizeSamplePool(
 
 void SamplePoolCoordinator::FillStatusScalarsLocked(
     rl::training::v1::SamplePoolStatusRsp* response) const {
-    FillContractIdentity(response->mutable_contract());
     FillServiceIdentity(response->mutable_sample_pool());
     response->set_ready(true);
     response->set_push_attempt_count(push_attempt_count_);

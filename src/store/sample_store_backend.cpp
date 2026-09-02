@@ -48,7 +48,6 @@ std::vector<StoredTransition> LocalTransitionStore::ExtractAllReady() {
 std::vector<StoredTransition>
 LocalTransitionStore::DrawUniformWithoutReplacement(
     size_t count,
-    const std::string& training_contract_digest_hex,
     std::mt19937_64* generator) {
     if (generator == nullptr) {
         throw std::invalid_argument("invalid uniform transition draw");
@@ -57,10 +56,7 @@ LocalTransitionStore::DrawUniformWithoutReplacement(
     std::vector<size_t> indices;
     indices.reserve(ready_.size());
     for (size_t index = 0; index < ready_.size(); ++index) {
-        if (ready_[index].training_contract_digest_hex ==
-            training_contract_digest_hex) {
-            indices.push_back(index);
-        }
+        indices.push_back(index);
     }
     if (count > indices.size()) {
         throw std::invalid_argument("insufficient eligible transitions");
