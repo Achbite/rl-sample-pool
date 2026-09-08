@@ -2,7 +2,7 @@
 
 #include "config/config_loader.h"
 #include "store/sample_store_backend.h"
-#include "training.pb.h"
+#include "proto/training/training.pb.h"
 
 #include <chrono>
 #include <condition_variable>
@@ -39,6 +39,9 @@ public:
         rl::training::v1::FinalizeSamplePoolRsp* response);
     void GetStatus(const rl::training::v1::SamplePoolStatusReq& request,
                    rl::training::v1::SamplePoolStatusRsp* response);
+
+    void FillServiceIdentity(
+        rl::common::v1::ServiceInstanceIdentity* identity) const;
 
     const std::string& instance_id() const;
 
@@ -83,8 +86,7 @@ private:
                                        int64_t estimated_bytes);
     rl::training::v1::PressureState PressureStateLocked() const;
 
-    void FillServiceIdentity(
-        rl::common::v1::ServiceInstanceIdentity* identity) const;
+
     void ReclaimExpiredLeaseLocked();
     void RequeueLeaseLocked(bool expired);
     void RememberDeliveryLocked(const std::string& delivery_id,

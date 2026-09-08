@@ -10,7 +10,7 @@ if [ "$#" -ne 0 ]; then
     exit 2
 fi
 
-if [ ! -f "${contract_cpp_dir}/training.pb.cc" ]; then
+if [ ! -f "${contract_cpp_dir}/proto/training/training.pb.cc" ]; then
     echo "CONTRACT_CPP_DIR must point to generated rl-contracts C++ bindings" >&2
     echo "current value: ${contract_cpp_dir}" >&2
     exit 1

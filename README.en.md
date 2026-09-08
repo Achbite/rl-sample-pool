@@ -13,7 +13,7 @@ bash ./test.sh
 `test.sh` is the repository's unified test entrypoint and runs the current
 development checks from an explicit allowlist.
 
-## 2. Build the 0.15.0 artifact
+## 2. Build the current artifact
 
 Create the task-neutral training-contract artifact first, then build from the
 current source:
@@ -27,7 +27,7 @@ The artifact script only compiles the production binary. Tests remain an explici
 `bash ./test.sh` operation from section 1. Output:
 
 ```text
-../.workspace/artifacts/rl-sample-pool/0.15.0/<platform>/
+../.workspace/artifacts/rl-sample-pool/<platform>/
 ```
 
 ## 3. Stage it into Learner

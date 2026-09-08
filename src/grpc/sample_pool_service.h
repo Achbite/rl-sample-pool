@@ -1,12 +1,15 @@
 #pragma once
 
 #include "store/sample_pool_coordinator.h"
-#include "training.grpc.pb.h"
+#include "proto/training/training.grpc.pb.h"
+#include "proto/metrics/catalog.pb.h"
 
 class SamplePoolIngressServiceImpl final
     : public rl::training::v1::SamplePoolIngressService::Service {
 public:
     explicit SamplePoolIngressServiceImpl(SamplePoolCoordinator& coordinator);
+
+    rl::training::v1::GetMetricCatalogRsp MetricCatalog();
 
     grpc::Status PushSamples(
         grpc::ServerContext* context,
