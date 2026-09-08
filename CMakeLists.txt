@@ -23,9 +23,13 @@ endif()
 
 set(PROTO_GEN_DIR ${CONTRACT_CPP_DIR})
 set(PROTO_SOURCES
-    ${PROTO_GEN_DIR}/common.pb.cc
-    ${PROTO_GEN_DIR}/training.pb.cc
-    ${PROTO_GEN_DIR}/training.grpc.pb.cc
+    ${PROTO_GEN_DIR}/proto/common/identity.pb.cc
+    ${PROTO_GEN_DIR}/proto/training/model_identity.pb.cc
+    ${PROTO_GEN_DIR}/proto/training/training.pb.cc
+    ${PROTO_GEN_DIR}/proto/training/training.grpc.pb.cc
+    ${PROTO_GEN_DIR}/proto/metrics/registry.pb.cc
+    ${PROTO_GEN_DIR}/proto/metrics/catalog.pb.cc
+    ${PROTO_GEN_DIR}/proto/metrics/catalog.grpc.pb.cc
 )
 
 add_executable(${PROJECT_NAME} ${SOURCES} ${PROTO_SOURCES})
@@ -50,8 +54,9 @@ if(BUILD_TESTING)
         src/config/config_loader.cpp
         src/store/sample_pool_coordinator.cpp
         src/store/sample_store_backend.cpp
-        ${PROTO_GEN_DIR}/common.pb.cc
-        ${PROTO_GEN_DIR}/training.pb.cc
+        ${PROTO_GEN_DIR}/proto/common/identity.pb.cc
+        ${PROTO_GEN_DIR}/proto/training/model_identity.pb.cc
+        ${PROTO_GEN_DIR}/proto/training/training.pb.cc
     )
     target_include_directories(sample_pool_development_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src

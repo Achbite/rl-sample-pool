@@ -78,3 +78,21 @@ grpc::Status SamplePoolConsumerServiceImpl::GetStatus(
     coordinator_.GetStatus(*request, response);
     return grpc::Status::OK;
 }
+
+#include "rl_sdk/metric_catalog.h"
+#include "proto/metrics/catalog.pb.h"
+
+rl::training::v1::GetMetricCatalogRsp SamplePoolIngressServiceImpl::MetricCatalog() {
+    namespace wire = rl::training::v1;
+    wire::GetMetricCatalogRsp catalog;
+    coordinator_.FillServiceIdentity(catalog.mutable_source());
+    const std::string method = "rl.training.v1.SamplePoolConsumerService/GetStatus";
+    rl_sdk::AddStatusMetric(catalog, "sample.flow.accepted.total", "Accepted Samples", "sample_flow", "count", "pool", method, "accepted_unique_transitions");
+    rl_sdk::AddStatusMetric(catalog, "sample.flow.acknowledged.total", "Acknowledged Samples", "sample_flow", "count", "pool", method, "acked_unique_transitions");
+    rl_sdk::AddStatusMetric(catalog, "sample.flow.trained.total", "Trained Samples", "sample_flow", "count", "pool", method, "trained_transition_count");
+    rl_sdk::AddStatusMetric(catalog, "sample.flow.invalid.total", "Invalid Samples", "sample_flow", "count", "pool", method, "invalid_transition_count");
+    rl_sdk::AddStatusMetric(catalog, "sample.flow.shutdown_untrained.total", "Shutdown Untrained", "sample_flow", "count", "pool", method, "shutdown_untrained_transition_count");
+    rl_sdk::AddStatusMetric(catalog, "sample.flow.ready.total", "Ready Samples", "sample_flow", "count", "pool", method, "ready_transitions");
+    rl_sdk::AddStatusMetric(catalog, "sample.flow.leased.total", "Leased Samples", "sample_flow", "count", "pool", method, "leased_transitions");
+    return catalog;
+}

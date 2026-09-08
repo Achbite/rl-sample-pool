@@ -12,7 +12,7 @@ bash ./test.sh
 
 `test.sh` 是本仓库的统一测试入口，并按显式清单运行当前开发校验。
 
-## 2. 构建 0.15.0 制品
+## 2. 构建当前制品
 
 先生成任务无关的训练协议制品，再从当前源码执行：
 
@@ -24,7 +24,7 @@ bash build_artifact.sh
 构建脚本只编译正式二进制；测试仍只通过第 1 节的 `bash ./test.sh` 显式运行。输出：
 
 ```text
-../.workspace/artifacts/rl-sample-pool/0.15.0/<platform>/
+../.workspace/artifacts/rl-sample-pool/<platform>/
 ```
 
 ## 3. 装配到 Learner
