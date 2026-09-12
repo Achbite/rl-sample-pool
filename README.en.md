@@ -52,6 +52,17 @@ distinct units. `action_mask` is stored and delivered unchanged like every other
 sample field. Sample Pool does not interpret task action semantics or require masks
 to be enabled.
 
+Each `SamplePoolItem` retains the complete `behavior_model` and `producer` from
+its accepted envelope, including across lease delivery, NACK and expiry. READY /
+resident byte accounting includes the serialized transition and both source
+fields. The
+Learner checks the actual model source; the Pool never reconstructs provenance
+from a local model, step or latest publication. Under its lock, `GetBatch` checks
+cancellation and the request deadline before handling READY samples and again
+after drawing, before creating a lease. An aborted draw restores the original
+READY order and counters; committed leases retain the existing ACK/NACK/expiry
+contract.
+
 ```bash
 # When build/maze_sample_pool already exists
 bash ./run.sh configs/pool_config.yaml
