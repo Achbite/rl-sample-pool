@@ -67,7 +67,8 @@ private:
     static int64_t NowMs();
     static std::string CreateInstanceId(const std::string& prefix);
     static int64_t EstimateBytes(
-        const rl::training::v1::ProcessedTransition& transition);
+        const rl::training::v1::ProcessedTransition& transition,
+        const rl::training::v1::ProcessedTransitionEnvelope& envelope);
     static bool IsServiceIdentityValid(
         const rl::common::v1::ServiceInstanceIdentity& identity);
     static std::string ServiceKey(

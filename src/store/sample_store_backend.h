@@ -10,6 +10,8 @@
 
 struct StoredTransition {
     rl::training::v1::ProcessedTransition transition;
+    rl::training::v1::ModelIdentity behavior_model;
+    rl::common::v1::ServiceInstanceIdentity producer;
     std::string envelope_id;
     uint64_t insert_sequence = 0;
     int64_t inserted_at_unix_ms = 0;

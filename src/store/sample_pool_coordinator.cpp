@@ -47,8 +47,10 @@ std::string SamplePoolCoordinator::CreateInstanceId(
 }
 
 int64_t SamplePoolCoordinator::EstimateBytes(
-    const rl::training::v1::ProcessedTransition& transition) {
-    const auto bytes = transition.ByteSizeLong();
+    const rl::training::v1::ProcessedTransition& transition,
+    const rl::training::v1::ProcessedTransitionEnvelope& envelope) {
+    const auto bytes = transition.ByteSizeLong() +
+        envelope.behavior_model().ByteSizeLong() + envelope.producer().ByteSizeLong();
     if (bytes > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
         throw std::overflow_error("processed transition size exceeds int64");
     }
@@ -346,14 +348,17 @@ void SamplePoolCoordinator::Push(
     }
 
     int64_t incoming_bytes = 0;
+    std::vector<int64_t> item_bytes;
+    item_bytes.reserve(envelope.samples_size());
     try {
         for (const auto& transition : envelope.samples()) {
-            const int64_t bytes = EstimateBytes(transition);
+            const int64_t bytes = EstimateBytes(transition, envelope);
             if (incoming_bytes >
                 std::numeric_limits<int64_t>::max() - bytes) {
                 throw std::overflow_error("envelope byte total overflow");
             }
             incoming_bytes += bytes;
+            item_bytes.push_back(bytes);
         }
     } catch (const std::exception& exception) {
         ++rejected_push_attempt_count_;
@@ -378,18 +383,22 @@ void SamplePoolCoordinator::Push(
     EvictReadyUntilCapacityLocked(attempted, incoming_bytes);
 
     const int64_t inserted_at = NowMs();
+    size_t item_index = 0;
     for (const auto& transition : envelope.samples()) {
+        const auto bytes = item_bytes[item_index++];
         StoredTransition stored;
         stored.transition = transition;
+        stored.behavior_model = envelope.behavior_model();
+        stored.producer = envelope.producer();
         stored.envelope_id = envelope.envelope_id();
         stored.insert_sequence = next_insert_sequence_++;
         stored.inserted_at_unix_ms = inserted_at;
-        stored.estimated_bytes = EstimateBytes(transition);
+        stored.estimated_bytes = bytes;
         backend_->PushBack(std::move(stored));
         ++ready_transitions_;
         ++resident_transitions_;
-        ready_estimated_bytes_ += EstimateBytes(transition);
-        resident_estimated_bytes_ += EstimateBytes(transition);
+        ready_estimated_bytes_ += bytes;
+        resident_estimated_bytes_ += bytes;
         resident_item_ids_.insert(transition.item_id());
         seen_item_ids_.insert(transition.item_id());
         seen_item_order_.push_back(transition.item_id());
@@ -442,6 +451,14 @@ void SamplePoolCoordinator::GetBatch(
     const auto deadline = started + timeout;
 
     while (true) {
+        // Cancellation must win over a READY notification: a request whose
+        // caller has left must not turn newly arrived samples into a lease.
+        if (is_cancelled() || std::chrono::steady_clock::now() >= deadline) {
+            ++empty_timeout_count_;
+            response->set_result(rl::training::v1::GET_BATCH_RESULT_TIMEOUT);
+            response->set_message("draw request was cancelled or timed out");
+            return;
+        }
         ReclaimExpiredLeaseLocked();
         if (has_lease_) {
             ++consumer_busy_count_;
@@ -452,18 +469,21 @@ void SamplePoolCoordinator::GetBatch(
         if (ready_transitions_ >= request.requested_transitions()) {
             break;
         }
-        if (is_cancelled() || std::chrono::steady_clock::now() >= deadline) {
-            ++empty_timeout_count_;
-            response->set_result(rl::training::v1::GET_BATCH_RESULT_TIMEOUT);
-            response->set_message("requested transition count is not ready");
-            return;
-        }
         cv_.wait_until(lock, deadline);
     }
 
     std::vector<StoredTransition> selected =
         backend_->DrawUniformWithoutReplacement(
             static_cast<size_t>(request.requested_transitions()), &random_);
+    // Drawing may itself cross the deadline. Before publishing a lease, return
+    // an aborted draw to READY with its original counters and FIFO order.
+    if (is_cancelled() || std::chrono::steady_clock::now() >= deadline) {
+        backend_->RestoreReady(std::move(selected));
+        ++empty_timeout_count_;
+        response->set_result(rl::training::v1::GET_BATCH_RESULT_TIMEOUT);
+        response->set_message("draw request was cancelled or timed out");
+        return;
+    }
     const int64_t leased_at = NowMs();
     const int64_t lease_timeout_ms = request.lease_timeout_ms();
     lease_.delivery_id = instance_id_ + "/delivery-" +
@@ -481,6 +501,8 @@ void SamplePoolCoordinator::GetBatch(
         lease_.estimated_bytes += item.estimated_bytes;
         auto* output = response->add_items();
         *output->mutable_transition() = item.transition;
+        *output->mutable_behavior_model() = item.behavior_model;
+        *output->mutable_producer() = item.producer;
         output->set_insert_sequence(item.insert_sequence);
         output->set_inserted_at_unix_ms(item.inserted_at_unix_ms);
         output->set_draw_count(item.draw_count);
