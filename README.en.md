@@ -15,31 +15,30 @@ development checks from an explicit allowlist.
 
 ## 2. Build the current artifact
 
-Create the task-neutral training-contract artifact first, then build from the
-current source:
+Supply an existing Contracts Training bundle containing `cpp/` and `sdk/`:
 
 ```bash
-(cd ../rl-contracts && bash build_artifact.sh training)
-bash build_artifact.sh
+CONTRACT_CPP_DIR=/path/to/training/cpp bash ./build.sh
 ```
 
-The artifact script only compiles the production binary. Tests remain an explicit
-`bash ./test.sh` operation from section 1. Output:
-
-```text
-../.workspace/artifacts/rl-sample-pool/<platform>/
-```
+This repository builds only its own source. It never builds or synchronizes upstream dependencies.
+Tests run explicitly through `bash ./test.sh`. The default output is
+`build/artifacts/production/<platform>/`; set `RL_ARTIFACT_ROOT` to select another output root.
+`build_dev_artifact.sh` uses the same implementation with the default output
+`build/artifacts/development/<platform>/current/`.
 
 ## 3. Stage it into Learner
 
-Prefer the Learner sync entrypoint to copy the complete artifact:
+With Framework's sibling repository layout, run from `rl-framework`:
 
 ```bash
-(cd ../rl-learner && bash scripts/sync_runtime_artifacts.sh)
+bash ./sync_artifacts.sh
+# Development artifact channel
+bash ./sync_artifacts.sh --development
 ```
 
-For development artifacts, Learner's `make deps` builds and stages both required
-binaries. `make shell` never performs that synchronization implicitly.
+Framework calls the Contracts, Pool and Distributor build entrypoints and explicitly stages
+selected artifacts into Learner. Component builds do not require this workspace layout.
 
 ## 4. Run it directly
 
@@ -73,3 +72,12 @@ During full training the Learner container supervises this process; no separate 
 ## License
 
 [MIT License](LICENSE)
+
+## Build input and cache ownership
+
+CMake/Ninja trees persist under `build/<platform>/<builder-image-id>/<channel>/` and ccache
+uses a persistent Docker volume. Successful builds select `build/maze_sample_pool` for `run.sh`
+and export the same binary. Run it in the same Linux toolchain environment; macOS hosts
+only orchestrate Docker compilation. Toolchain identity partitions caches, not runtime admission.
+
+Linux container builds refresh input attributes with `stat --cached=never` before CMake/Ninja, so a host edit is not hidden by virtiofs metadata caching. This neither changes source timestamps nor synchronizes upstream artifacts.

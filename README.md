@@ -14,28 +14,28 @@ bash ./test.sh
 
 ## 2. 构建当前制品
 
-先生成任务无关的训练协议制品，再从当前源码执行：
+显式提供已经生成的 Contracts Training 制品目录（其中包含 `cpp/` 与 `sdk/`）：
 
 ```bash
-(cd ../rl-contracts && bash build_artifact.sh training)
-bash build_artifact.sh
+CONTRACT_CPP_DIR=/path/to/training/cpp bash ./build.sh
 ```
 
-构建脚本只编译正式二进制；测试仍只通过第 1 节的 `bash ./test.sh` 显式运行。输出：
-
-```text
-../.workspace/artifacts/rl-sample-pool/<platform>/
-```
+本仓只构建自身，不构建或同步上游。构建脚本只编译正式二进制；测试仍通过 `bash ./test.sh` 显式运行。
+默认输出到 `build/artifacts/production/<platform>/`；调用者可以用 `RL_ARTIFACT_ROOT` 指定输出根目录。
+`bash build_dev_artifact.sh` 使用相同实现，默认输出到 `build/artifacts/development/<platform>/current/`。
 
 ## 3. 装配到 Learner
 
-推荐使用 Learner 同步入口复制完整制品：
+在遵循 Framework 同级仓库布局的工作区，从 `rl-framework` 执行：
 
 ```bash
-(cd ../rl-learner && bash scripts/sync_runtime_artifacts.sh)
+bash ./sync_artifacts.sh
+# 开发制品通道
+bash ./sync_artifacts.sh --development
 ```
 
-开发制品可由 Learner 的 `make deps` 统一构建和同步；`make shell` 不会隐式执行该操作。
+Framework 显式调用 Contracts、Pool 和 Distributor 各自的构建入口，再将所选制品装配到 Learner。
+组件仓不依赖这种目录布局，单独构建也不会修改 Learner。
 
 ## 4. 单独运行
 
@@ -62,3 +62,9 @@ bash ./run.sh configs/pool_config.yaml
 ## License
 
 [MIT License](LICENSE)
+
+## 构建与运行路径
+
+CMake/Ninja 构建目录位于 `build/<platform>/<builder-image-id>/<channel>/`，ccache 使用持久 Docker 卷。构建成功后 `build/maze_sample_pool` 指向本次二进制，同时导出制品；在相同 Linux 工具链环境中执行 `bash run.sh` 使用该输出。macOS 宿主负责 Docker 构建，不直接执行 Linux ELF。正常重建不清理缓存；构建镜像身份仅隔离工具链缓存，不参与运行准入。
+
+Linux 容器构建前用 `stat --cached=never` 刷新实际输入的文件属性，避免 virtiofs 暂存旧 mtime 导致刚保存的宿主源码被误判为 no-op；不会修改源码时间戳或同步上游制品。
