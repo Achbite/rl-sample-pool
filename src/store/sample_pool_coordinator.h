@@ -51,9 +51,8 @@ private:
         std::string consumer_instance_id;
         std::chrono::steady_clock::time_point deadline;
         int64_t deadline_unix_ms = 0;
-        std::vector<StoredTransition> items;
+        // Delivery metadata only; resident items are never leased out.
         int64_t transition_count = 0;
-        int64_t estimated_bytes = 0;
     };
 
     struct DeliveryRecord {
@@ -83,13 +82,12 @@ private:
                               int64_t estimated_bytes) const;
     bool CanMakeCapacityLocked(int64_t transitions,
                                int64_t estimated_bytes) const;
-    void EvictReadyUntilCapacityLocked(int64_t transitions,
+    void EvictUntilCapacityLocked(int64_t transitions,
                                        int64_t estimated_bytes);
     rl::training::v1::PressureState PressureStateLocked() const;
 
 
     void ReclaimExpiredLeaseLocked();
-    void RequeueLeaseLocked(bool expired);
     void RememberDeliveryLocked(const std::string& delivery_id,
                                 const DeliveryRecord& record);
     void RememberCompletedEnvelopeLocked(const std::string& envelope_id);
@@ -123,8 +121,6 @@ private:
     uint64_t next_insert_sequence_ = 1;
     uint64_t next_delivery_sequence_ = 1;
 
-    int64_t ready_transitions_ = 0;
-    int64_t ready_estimated_bytes_ = 0;
     int64_t resident_transitions_ = 0;
     int64_t resident_estimated_bytes_ = 0;
 
@@ -135,12 +131,12 @@ private:
     int64_t duplicate_transition_attempts_ = 0;
     int64_t rejected_push_attempt_count_ = 0;
     int64_t rejected_transition_attempts_ = 0;
-    int64_t acked_unique_transitions_ = 0;
+    int64_t acknowledged_transition_slot_count_ = 0;
     int64_t acked_unique_deliveries_ = 0;
     int64_t trained_transition_count_ = 0;
     int64_t invalid_transition_count_ = 0;
     int64_t shutdown_untrained_transition_count_ = 0;
-    int64_t redelivery_count_ = 0;
+    int64_t released_transition_slot_count_ = 0;
     int64_t nack_count_ = 0;
     int64_t expired_lease_count_ = 0;
     int64_t lease_renew_count_ = 0;

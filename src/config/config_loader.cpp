@@ -209,10 +209,17 @@ bool LoadSamplePoolConfig(const std::string& yaml_path,
         return false;
     }
     parsed.backend_type = *backend_type;
+    if (*sampling_strategy == "uniform_without_replacement") {
+        parsed.sampling_strategy = SamplingStrategy::UniformWithoutReplacement;
+    } else if (*sampling_strategy == "uniform_with_replacement") {
+        parsed.sampling_strategy = SamplingStrategy::UniformWithReplacement;
+    } else {
+        std::cerr << "[SamplePool] sampling.strategy is invalid" << std::endl;
+        return false;
+    }
     if (parsed.listen_port <= 0 || parsed.listen_port > 65535 ||
         parsed.backend_type != "local_memory" ||
         parsed.capacity_transitions <= 0 || parsed.capacity_bytes <= 0 ||
-        *sampling_strategy != "uniform_without_replacement" ||
         *eviction_strategy != "fifo_ready" ||
         parsed.max_dedup_entries <= 0 ||
         parsed.high_watermark_ratio <= 0.0 ||

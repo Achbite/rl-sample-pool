@@ -39,18 +39,32 @@ Framework 显式调用 Contracts、Pool 和 Distributor 各自的构建入口，
 
 ## 4. 单独运行
 
-当前 backend 存储独立 processed transition。训练 draw 在 READY 集合中执行 Uniform
-无放回选择；TRAINED ACK 后删除，NACK 恢复 READY，容量压力只按 FIFO 淘汰最老 READY Item。
-它不按 behavior `model_step` 做陈旧度门禁，也不把 Producer envelope、GAE segment 或 Learner
-train batch 混成同一个容量单位。`action_mask` 与其他样本字段一样按字节合同原样保存和交付；
-Sample Pool 不判断任务动作语义，也不要求 mask 必须启用。
+当前 backend 是非破坏性 Replay Pool：样本写入后持续驻留，采样只生成独立 batch 快照。
+`sampling.strategy` 默认为 `uniform_without_replacement`，仅禁止同一个 batch 内重复；
+可改为 `uniform_with_replacement`，允许同一 item 在 batch 内出现多次。两种模式都允许跨 batch
+复用，且都保留“驻留样本数达到 requested_transitions 后才返回完整 batch”的就绪门槛。
 
-每个 `SamplePoolItem` 保留其输入 Envelope 的完整 `behavior_model` 和 `producer`。
-READY / resident 的字节计量包含 transition 及这两个来源字段的序列化大小。
-租约投递、NACK 和到期回队列均携带相同来源；Learner 根据实际来源判断模型身份，
-Pool 不根据本地模型、step 或最新发布记录补写来源。`GetBatch` 在锁内检查取消和请求
-期限，再处理 READY 样本；抽样后、建立租约前再次检查。未提交的取消抽样恢复原始 READY
-顺序和计数，已建立的租约继续按现有 ACK/NACK/到期合同处理。
+ACK、NACK 和租约到期只结算 batch，不删除、恢复或刷新池内样本。容量压力仍按原始插入顺序
+FIFO 淘汰最老驻留对象，包含正在被某个 batch 使用的原对象；已经返回的快照不受淘汰影响。
+`ready_transitions` 等于可采样的驻留数量，`leased_transitions` 则是独立在途 batch 的位置数，
+不能把两者相加当作 resident。仍只允许一个在途 batch，不扩展并行 Learner。
+
+每个 `SamplePoolItem` 保留 Envelope 的完整 `behavior_model`、`producer`、原 item ID 与插入事实。
+`draw_count` 记录实际累计抽样位置次数；同 batch 重复位置携带相同的批次末快照。
+驻留字节包含 transition 和两个来源字段，不包含已经复制给消费者的 batch。
+Pool 不解释任务、动作 mask、模型兼容性或陈旧度，不重算 GAE、不生成替代身份。
+
+`GetBatch` 在锁内于选择前和提交 draw_count/交付租约前检查取消和期限；未提交的取消抽样不改变
+驻留顺序或计数。TRAINED/INVALID/SHUTDOWN_UNTRAINED 只统计明确 ACK 的 batch 位置；
+`acknowledged_transition_slot_count` 是所有已 ACK 位置，`released_transition_slot_count` 是
+NACK/到期释放的位置。finalize 清理驻留数据，单独计入 `finalized_transition_count`，不将 Replay
+尾部误记为未训练。两套计数分别满足：
+
+```text
+accepted_unique = resident + evicted + finalized
+drawn_slots = acknowledged_slots + released_slots + leased_slots
+acknowledged_slots = trained + invalid + shutdown_untrained
+```
 
 ```bash
 # 已有本地 build/maze_sample_pool 时

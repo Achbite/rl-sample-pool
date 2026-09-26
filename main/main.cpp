@@ -54,7 +54,9 @@ int main(int argc, char* argv[]) {
               << config.capacity_transitions
               << ", capacity_bytes="
               << config.capacity_bytes
-              << ", sampling=uniform_without_replacement"
+              << ", sampling="
+              << (config.sampling_strategy == SamplingStrategy::UniformWithReplacement
+                      ? "uniform_with_replacement" : "uniform_without_replacement")
               << ", sampling_seed=" << config.sampling_seed
               << ", eviction=fifo_ready"
               << ", default_get_timeout_ms="

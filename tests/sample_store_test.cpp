@@ -5,6 +5,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <future>
+#include <filesystem>
+#include <fstream>
+#include <unistd.h>
 #include <grpcpp/grpcpp.h>
 #include <iostream>
 #include <map>
@@ -133,8 +136,34 @@ void TestPushGetAck() {
     rl::training::v1::SamplePoolStatusRsp status_response;
     pool.GetStatus(status_request, &status_response);
     Require(status_response.leased_transitions() == 0 &&
-                status_response.resident_transitions() == 0,
-            "the trained transitions no longer belong to the delivery");
+                status_response.resident_transitions() == 2 &&
+                status_response.ready_transitions() == 2 &&
+                status_response.trained_transition_count() == 2,
+            "ACK settles batch slots without consuming resident replay items");
+    pool.Ack(ack_request, &ack_response);
+    Require(ack_response.result() == rl::training::v1::DELIVERY_RESULT_ALREADY_APPLIED,
+            "duplicate ACK is idempotent");
+    rl::training::v1::GetBatchRsp replay;
+    pool.GetBatch(get_request, &replay, [] { return false; });
+    Require(replay.items_size() == 2, "a trained item can be sampled in a later batch");
+    for (int index = 0; index < replay.items_size(); ++index) {
+        const auto& item = replay.items(index);
+        Require(item.transition().SerializeAsString() == get_response.items(index).transition().SerializeAsString() &&
+                item.insert_sequence() == get_response.items(index).insert_sequence() &&
+                item.inserted_at_unix_ms() == get_response.items(index).inserted_at_unix_ms() &&
+                item.draw_count() == 2, "replay keeps item identity, payload and insertion age");
+    }
+    ack_request.set_delivery_id(replay.delivery_id());
+    ack_request.set_train_update_id("update-replay");
+    pool.Ack(ack_request, &ack_response);
+    status_response.Clear();
+    pool.GetStatus(status_request, &status_response);
+    Require(status_response.accepted_unique_transitions() == 2 &&
+                status_response.trained_transition_count() == 4 &&
+                status_response.acknowledged_transition_slot_count() == 4 &&
+                status_response.drawn_transition_slot_count() == 4 &&
+                status_response.resident_transitions() == 2,
+            "replay training slots exceed unique ingress without double-settling ACK");
 }
 
 namespace wire = rl::training::v1;
@@ -163,7 +192,7 @@ void Push(SamplePoolCoordinator& pool, const wire::ProcessedTransitionEnvelope& 
             "Push accepts test facts: " + response.message());
 }
 
-void TestProvenanceSurvivesRedelivery() {
+void TestProvenanceSurvivesRepeatedDraws() {
     SamplePoolCoordinator pool(MakeConfig());
     auto first = MakeEnvelope(), second = MakeEnvelope();
     second.set_envelope_id("envelope-other");
@@ -195,10 +224,10 @@ void TestProvenanceSurvivesRedelivery() {
             Require(item.transition().SerializeAsString() == input.transition().SerializeAsString() &&
                     item.behavior_model().SerializeAsString() == input.behavior_model().SerializeAsString() &&
                     item.producer().SerializeAsString() == input.producer().SerializeAsString() && item.draw_count() == draw,
-                    "item preserves actual model/producer and draw history through NACK and expiry");
+                    "item preserves actual model/producer and draw history across batches");
         }
         Require(Status(pool).resident_estimated_bytes() == expected_bytes,
-                "resident bytes include transition and source fields while leased");
+                "batch snapshots do not change resident byte accounting");
         if (draw == 2) {
             const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(2);
             while (Status(pool).leased_transitions() && std::chrono::steady_clock::now() < limit)
@@ -209,16 +238,16 @@ void TestProvenanceSurvivesRedelivery() {
             nack.set_delivery_id(response.delivery_id());
             wire::DeliveryRsp result;
             pool.Nack(nack, &result);
-            Require(result.result() == wire::DELIVERY_RESULT_APPLIED, "NACK restores the lease");
+            Require(result.result() == wire::DELIVERY_RESULT_APPLIED, "NACK releases the delivery only");
         }
         const auto restored = Status(pool);
         Require(restored.ready_transitions() == 4 && restored.leased_transitions() == 0 &&
                 restored.resident_estimated_bytes() == expected_bytes,
-                "READY/resident count and bytes survive lease restoration");
+                "delivery release leaves all resident items eligible and unchanged");
     }
 }
 
-void TestCancellationWinsReadyAndRestoresDraw() {
+void TestCancellationWinsReadyAndPreservesDraw() {
     for (bool cancel_after_admission : {false, true}) {
         auto config = MakeConfig();
         config.capacity_transitions = 2;
@@ -298,12 +327,189 @@ void TestGrpcDeadlineReachesCoordinator() {
             "subsequent valid request can use the untouched samples");
 }
 
+SamplePoolConfig LoadSamplingConfig(const std::string& strategy) {
+    const auto path = std::filesystem::temp_directory_path() /
+        ("replay-pool-config-" + std::to_string(getpid()) + ".yaml");
+    {
+        std::ofstream output(path);
+        output << "server:\n  listen_port: 9100\nbackend:\n  type: local_memory\n"
+               << "storage:\n  capacity_transitions: 16\n  capacity_bytes: 1048576\n"
+               << "sampling:\n  strategy: " << strategy << "\n  seed: 7\n"
+               << "eviction:\n  strategy: fifo_ready\nqueue:\n  max_dedup_entries: 64\n"
+               << "  high_watermark_ratio: 0.8\n  default_get_timeout_ms: 1000\n"
+               << "  default_lease_timeout_ms: 1000\n  delivery_history_size: 16\n";
+        Require(static_cast<bool>(output), "write explicit sampling config fixture");
+    }
+    SamplePoolConfig config;
+    const bool loaded = LoadSamplePoolConfig(path.string(), config);
+    std::filesystem::remove(path);
+    Require(loaded, "actual configuration loader accepts " + strategy);
+    return config;
+}
+
+void TestSamplingModes() {
+    for (const auto& strategy : {std::string("uniform_without_replacement"),
+                                 std::string("uniform_with_replacement")}) {
+        SamplePoolCoordinator pool(LoadSamplingConfig(strategy));
+        auto envelope = MakeEnvelope();
+        const auto original = envelope.samples(0);
+        for (int index = 2; index < 4; ++index) {
+            auto* item = envelope.add_samples();
+            *item = original;
+            item->set_item_id("item-" + std::to_string(index));
+        }
+        Push(pool, envelope);
+        const auto initial = Status(pool);
+        std::map<std::string, uint32_t> draws;
+        bool saw_duplicate = false;
+        for (int batch = 0; batch < 8; ++batch) {
+            const auto request = DrawRequest(4);
+            wire::GetBatchRsp response;
+            pool.GetBatch(request, &response, [] { return false; });
+            Require(response.result() == wire::GET_BATCH_RESULT_LEASED && response.items_size() == 4,
+                    "exact batch snapshot is available without new ingress");
+            std::set<std::string> ids;
+            for (const auto& item : response.items()) {
+                ids.insert(item.transition().item_id());
+                ++draws[item.transition().item_id()];
+            }
+            saw_duplicate = saw_duplicate || ids.size() < 4;
+            if (strategy == "uniform_without_replacement")
+                Require(ids.size() == 4, "default sampling has no duplicates inside a batch");
+            std::map<std::string, std::string> snapshots;
+            for (const auto& item : response.items()) {
+                const auto& id = item.transition().item_id();
+                Require(item.draw_count() == draws.at(id), "draw_count counts committed slots including repeats");
+                const auto inserted = snapshots.emplace(id, item.SerializeAsString());
+                Require(inserted.second || inserted.first->second == item.SerializeAsString(),
+                        "repeated slots contain the same complete snapshot");
+            }
+            wire::AckBatchReq ack;
+            *ack.mutable_consumer() = request.consumer();
+            ack.set_delivery_id(response.delivery_id());
+            ack.set_disposition(wire::ACK_DISPOSITION_TRAINED);
+            ack.set_train_update_id("update-" + std::to_string(batch));
+            wire::DeliveryRsp result;
+            pool.Ack(ack, &result);
+            Require(result.result() == wire::DELIVERY_RESULT_APPLIED, "settle actual selected batch");
+            const auto status = Status(pool);
+            Require(status.resident_transitions() == 4 && status.ready_transitions() == 4 &&
+                    status.resident_estimated_bytes() == initial.resident_estimated_bytes() &&
+                    status.trained_transition_count() == (batch + 1) * 4,
+                    "training settlement cannot consume or multiply resident objects");
+        }
+        if (strategy == "uniform_with_replacement")
+            Require(saw_duplicate, "fixed-seed with-replacement draws contain repeated slots");
+    }
+}
+
+void TestEvictionDuringDelivery() {
+    for (const auto& settlement : {std::string("ack"), std::string("nack"), std::string("expiry")}) {
+        auto config = MakeConfig();
+        config.capacity_transitions = 2;
+        SamplePoolCoordinator pool(config);
+        Push(pool, MakeEnvelope());
+        auto request = DrawRequest();
+        if (settlement == "expiry") request.set_lease_timeout_ms(100);
+        wire::GetBatchRsp batch;
+        pool.GetBatch(request, &batch, [] { return false; });
+        const std::string snapshot = batch.SerializeAsString();
+        auto newer = MakeEnvelope();
+        newer.set_envelope_id("new-envelope");
+        for (auto& item : *newer.mutable_samples()) item.set_item_id("new-" + item.item_id());
+        Push(pool, newer);
+        const auto evicted = Status(pool);
+        Require(evicted.evicted_transition_count() == 2 && evicted.resident_transitions() == 2 &&
+                evicted.previously_drawn_evicted_transition_count() == 2 &&
+                batch.SerializeAsString() == snapshot,
+                "FIFO can evict sampled residents without altering the delivered snapshot");
+        wire::DeliveryRsp result;
+        if (settlement == "ack") {
+            wire::AckBatchReq ack;
+            *ack.mutable_consumer() = request.consumer();
+            ack.set_delivery_id(batch.delivery_id());
+            ack.set_disposition(wire::ACK_DISPOSITION_TRAINED);
+            ack.set_train_update_id("evicted-snapshot-update");
+            pool.Ack(ack, &result);
+            Require(result.result() == wire::DELIVERY_RESULT_APPLIED, "ACK works after all source residents were evicted");
+        } else if (settlement == "nack") {
+            wire::NackBatchReq nack;
+            *nack.mutable_consumer() = request.consumer();
+            nack.set_delivery_id(batch.delivery_id());
+            pool.Nack(nack, &result);
+            Require(result.result() == wire::DELIVERY_RESULT_APPLIED, "NACK releases only delivery metadata");
+        } else {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (Status(pool).leased_transitions() && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        const auto settled = Status(pool);
+        Require(settled.leased_transitions() == 0 && settled.resident_transitions() == 2 &&
+                settled.resident_estimated_bytes() == evicted.resident_estimated_bytes() &&
+                settled.drawn_transition_slot_count() == settled.acknowledged_transition_slot_count() +
+                    settled.released_transition_slot_count(),
+                "settlement leaves residency unchanged and balances delivery slots");
+        wire::GetBatchRsp next;
+        pool.GetBatch(DrawRequest(), &next, [] { return false; });
+        std::set<std::string> ids;
+        for (const auto& item : next.items()) ids.insert(item.transition().item_id());
+        Require(ids == std::set<std::string>({"new-item-0", "new-item-1"}),
+                "settlement cannot resurrect FIFO-evicted samples");
+    }
+}
+
+void TestReplayFinalization() {
+    SamplePoolCoordinator pool(MakeConfig());
+    Push(pool, MakeEnvelope());
+    auto request = DrawRequest();
+    wire::FinalizeSamplePoolReq finalize;
+    *finalize.mutable_consumer() = request.consumer();
+    *finalize.mutable_expected_sample_pool() = Status(pool).sample_pool();
+    finalize.set_finalization_id("replay-final");
+    int update = 0;
+    for (auto disposition : {wire::ACK_DISPOSITION_TRAINED, wire::ACK_DISPOSITION_INVALID,
+                            wire::ACK_DISPOSITION_SHUTDOWN_UNTRAINED}) {
+        wire::GetBatchRsp batch;
+        pool.GetBatch(request, &batch, [] { return false; });
+        wire::FinalizeSamplePoolRsp premature;
+        pool.FinalizeSamplePool(finalize, &premature);
+        Require(premature.result() == wire::SAMPLE_POOL_FINALIZE_RESULT_REJECTED_ACTIVE_LEASE &&
+                Status(pool).resident_transitions() == 2, "finalize waits for batch settlement without clearing residents");
+        wire::AckBatchReq ack;
+        *ack.mutable_consumer() = request.consumer();
+        ack.set_delivery_id(batch.delivery_id());
+        ack.set_disposition(disposition);
+        ack.set_train_update_id("final-update-" + std::to_string(++update));
+        wire::DeliveryRsp settled;
+        pool.Ack(ack, &settled);
+        Require(settled.result() == wire::DELIVERY_RESULT_APPLIED && Status(pool).resident_transitions() == 2,
+                "all ACK dispositions settle slots without deleting samples");
+    }
+    wire::FinalizeSamplePoolRsp done;
+    pool.FinalizeSamplePool(finalize, &done);
+    auto status = Status(pool);
+    Require(done.result() == wire::SAMPLE_POOL_FINALIZE_RESULT_FINALIZED && status.finalized() &&
+            !status.ingress_ready() && !status.pool_ready() && status.resident_transitions() == 0 &&
+            status.ready_transitions() == 0 && status.resident_estimated_bytes() == 0 &&
+            status.finalized_transition_count() == 2 && status.accepted_unique_transitions() == 2 &&
+            status.acknowledged_transition_slot_count() == 6 && status.drawn_transition_slot_count() == 6 &&
+            status.trained_transition_count() == 2 && status.invalid_transition_count() == 2 &&
+            status.shutdown_untrained_transition_count() == 2,
+            "finalize clears residents without counting the replay tail as untrained batch slots");
+    pool.FinalizeSamplePool(finalize, &done);
+    Require(done.result() == wire::SAMPLE_POOL_FINALIZE_RESULT_ALREADY_FINALIZED &&
+            Status(pool).finalized_transition_count() == 2, "finalize is idempotent");
+}
+
 }  // namespace
 
 int main() {
     TestPushGetAck();
-    TestProvenanceSurvivesRedelivery();
-    TestCancellationWinsReadyAndRestoresDraw();
+    TestSamplingModes();
+    TestEvictionDuringDelivery();
+    TestReplayFinalization();
+    TestProvenanceSurvivesRepeatedDraws();
+    TestCancellationWinsReadyAndPreservesDraw();
     TestCancellationWhileWaiting();
     TestGrpcDeadlineReachesCoordinator();
     std::cout << "sample_pool_data_path: PASS" << std::endl;

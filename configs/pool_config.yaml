@@ -8,8 +8,10 @@ storage:
   capacity_transitions: 10240
   capacity_bytes: 536870912
 
+# Both modes read snapshots without consuming resident samples. This choice
+# only controls duplicate item IDs within one batch; cross-batch reuse is allowed.
 sampling:
-  strategy: uniform_without_replacement
+  strategy: uniform_without_replacement  # or uniform_with_replacement
   seed: 0
 
 eviction:

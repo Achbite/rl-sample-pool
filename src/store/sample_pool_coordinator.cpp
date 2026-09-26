@@ -142,14 +142,9 @@ bool SamplePoolCoordinator::CapacityAllowsLocked(
 bool SamplePoolCoordinator::CanMakeCapacityLocked(
     int64_t transitions,
     int64_t estimated_bytes) const {
-    if (transitions > config_.capacity_transitions ||
-        estimated_bytes > config_.capacity_bytes) {
-        return false;
-    }
-    return resident_transitions_ - ready_transitions_ <=
-               config_.capacity_transitions - transitions &&
-           resident_estimated_bytes_ - ready_estimated_bytes_ <=
-               config_.capacity_bytes - estimated_bytes;
+    // A batch owns snapshots, so every resident item remains evictable.
+    return transitions <= config_.capacity_transitions &&
+           estimated_bytes <= config_.capacity_bytes;
 }
 
 void SamplePoolCoordinator::RemoveResidentItemLocked(
@@ -164,13 +159,11 @@ void SamplePoolCoordinator::RemoveResidentItemLocked(
     }
 }
 
-void SamplePoolCoordinator::EvictReadyUntilCapacityLocked(
+void SamplePoolCoordinator::EvictUntilCapacityLocked(
     int64_t transitions,
     int64_t estimated_bytes) {
     while (!CapacityAllowsLocked(transitions, estimated_bytes)) {
-        StoredTransition item = backend_->EvictOldestReady();
-        --ready_transitions_;
-        ready_estimated_bytes_ -= item.estimated_bytes;
+        StoredTransition item = backend_->EvictOldest();
         const bool envelope_will_be_empty =
             resident_by_envelope_.count(item.envelope_id) == 1 &&
             resident_by_envelope_.at(item.envelope_id) == 1;
@@ -218,25 +211,14 @@ void SamplePoolCoordinator::FillServiceIdentity(
     identity->set_lifecycle_epoch(1);
 }
 
-void SamplePoolCoordinator::RequeueLeaseLocked(bool expired) {
-    if (!has_lease_) return;
-    const int64_t count = lease_.transition_count;
-    backend_->RestoreReady(std::move(lease_.items));
-    ready_transitions_ += count;
-    ready_estimated_bytes_ += lease_.estimated_bytes;
-    if (expired) {
-        ++expired_lease_count_;
-        redelivery_count_ += count;
-    }
-    lease_ = Lease{};
-    has_lease_ = false;
-    cv_.notify_all();
-}
-
 void SamplePoolCoordinator::ReclaimExpiredLeaseLocked() {
     if (has_lease_ &&
         std::chrono::steady_clock::now() >= lease_.deadline) {
-        RequeueLeaseLocked(true);
+        ++expired_lease_count_;
+        released_transition_slot_count_ += lease_.transition_count;
+        lease_ = Lease{};
+        has_lease_ = false;
+        cv_.notify_all();
     }
 }
 
@@ -373,14 +355,14 @@ void SamplePoolCoordinator::Push(
     if (!CanMakeCapacityLocked(attempted, incoming_bytes)) {
         ++rejected_push_attempt_count_;
         rejected_transition_attempts_ += attempted;
-        last_error_ = "insufficient evictable READY capacity";
+        last_error_ = "envelope exceeds SamplePool capacity";
         response->set_result(
             rl::training::v1::PUSH_RESULT_REJECTED_CAPACITY);
         response->set_message(last_error_);
         response->set_pressure_state(PressureStateLocked());
         return;
     }
-    EvictReadyUntilCapacityLocked(attempted, incoming_bytes);
+    EvictUntilCapacityLocked(attempted, incoming_bytes);
 
     const int64_t inserted_at = NowMs();
     size_t item_index = 0;
@@ -395,9 +377,7 @@ void SamplePoolCoordinator::Push(
         stored.inserted_at_unix_ms = inserted_at;
         stored.estimated_bytes = bytes;
         backend_->PushBack(std::move(stored));
-        ++ready_transitions_;
         ++resident_transitions_;
-        ready_estimated_bytes_ += bytes;
         resident_estimated_bytes_ += bytes;
         resident_item_ids_.insert(transition.item_id());
         seen_item_ids_.insert(transition.item_id());
@@ -466,24 +446,25 @@ void SamplePoolCoordinator::GetBatch(
             response->set_message("single consumer lease is active");
             return;
         }
-        if (ready_transitions_ >= request.requested_transitions()) {
+        if (resident_transitions_ >= request.requested_transitions()) {
             break;
         }
         cv_.wait_until(lock, deadline);
     }
 
-    std::vector<StoredTransition> selected =
-        backend_->DrawUniformWithoutReplacement(
-            static_cast<size_t>(request.requested_transitions()), &random_);
-    // Drawing may itself cross the deadline. Before publishing a lease, return
-    // an aborted draw to READY with its original counters and FIFO order.
+    const auto indices = backend_->SelectUniform(
+        static_cast<size_t>(request.requested_transitions()),
+        config_.sampling_strategy == SamplingStrategy::UniformWithReplacement,
+        &random_);
+    // Selection changes no item facts. Cancellation before commit needs no
+    // reinsertion and cannot change FIFO order or committed draw history.
     if (is_cancelled() || std::chrono::steady_clock::now() >= deadline) {
-        backend_->RestoreReady(std::move(selected));
         ++empty_timeout_count_;
         response->set_result(rl::training::v1::GET_BATCH_RESULT_TIMEOUT);
         response->set_message("draw request was cancelled or timed out");
         return;
     }
+    const auto selected = backend_->SnapshotDraw(indices);
     const int64_t leased_at = NowMs();
     const int64_t lease_timeout_ms = request.lease_timeout_ms();
     lease_.delivery_id = instance_id_ + "/delivery-" +
@@ -494,11 +475,8 @@ void SamplePoolCoordinator::GetBatch(
         std::chrono::milliseconds(lease_timeout_ms);
     lease_.deadline_unix_ms = leased_at + lease_timeout_ms;
     lease_.transition_count = selected.size();
-    lease_.estimated_bytes = 0;
 
-    for (auto& item : selected) {
-        ++item.draw_count;
-        lease_.estimated_bytes += item.estimated_bytes;
+    for (const auto& item : selected) {
         auto* output = response->add_items();
         *output->mutable_transition() = item.transition;
         *output->mutable_behavior_model() = item.behavior_model;
@@ -507,10 +485,7 @@ void SamplePoolCoordinator::GetBatch(
         output->set_inserted_at_unix_ms(item.inserted_at_unix_ms);
         output->set_draw_count(item.draw_count);
     }
-    lease_.items = std::move(selected);
     drawn_transition_slot_count_ += lease_.transition_count;
-    ready_transitions_ -= lease_.transition_count;
-    ready_estimated_bytes_ -= lease_.estimated_bytes;
     has_lease_ = true;
     ++target_hit_count_;
 
@@ -570,7 +545,6 @@ void SamplePoolCoordinator::Ack(
     }
 
     const int64_t affected = lease_.transition_count;
-    for (const auto& item : lease_.items) RemoveResidentItemLocked(item);
     if (disposition == rl::training::v1::ACK_DISPOSITION_TRAINED) {
         trained_transition_count_ += affected;
     } else if (disposition == rl::training::v1::ACK_DISPOSITION_INVALID) {
@@ -578,7 +552,7 @@ void SamplePoolCoordinator::Ack(
     } else {
         shutdown_untrained_transition_count_ += affected;
     }
-    acked_unique_transitions_ += affected;
+    acknowledged_transition_slot_count_ += affected;
     ++acked_unique_deliveries_;
     latest_ack_unix_ms_ = NowMs();
 
@@ -629,12 +603,8 @@ void SamplePoolCoordinator::Nack(
         return;
     }
 
-    const int64_t affected = lease_.transition_count;
-    backend_->RestoreReady(std::move(lease_.items));
-    ready_transitions_ += affected;
-    ready_estimated_bytes_ += lease_.estimated_bytes;
     ++nack_count_;
-    redelivery_count_ += affected;
+    released_transition_slot_count_ += lease_.transition_count;
     DeliveryRecord record;
     record.result = rl::training::v1::DELIVERY_RESULT_APPLIED;
     RememberDeliveryLocked(request.delivery_id(), record);
@@ -642,7 +612,7 @@ void SamplePoolCoordinator::Nack(
     has_lease_ = false;
 
     response->set_result(rl::training::v1::DELIVERY_RESULT_APPLIED);
-    response->set_message("delivery returned to READY");
+    response->set_message("delivery released; replay residency unchanged");
     cv_.notify_all();
 }
 
@@ -718,12 +688,12 @@ void SamplePoolCoordinator::FinalizeSamplePool(
         return;
     }
 
-    std::vector<StoredTransition> tail = backend_->ExtractAllReady();
-    finalized_transition_count_ = tail.size();
-    for (const auto& item : tail) RemoveResidentItemLocked(item);
-    shutdown_untrained_transition_count_ += finalized_transition_count_;
-    ready_transitions_ = 0;
-    ready_estimated_bytes_ = 0;
+    finalized_transition_count_ = resident_transitions_;
+    backend_->Clear();
+    resident_transitions_ = 0;
+    resident_estimated_bytes_ = 0;
+    resident_item_ids_.clear();
+    resident_by_envelope_.clear();
     finalized_ = true;
     finalization_id_ = request.finalization_id();
     finalization_consumer_key_ = consumer_key;
@@ -731,7 +701,7 @@ void SamplePoolCoordinator::FinalizeSamplePool(
 
     response->set_result(
         rl::training::v1::SAMPLE_POOL_FINALIZE_RESULT_FINALIZED);
-    response->set_message("READY tail settled as SHUTDOWN_UNTRAINED");
+    response->set_message("resident replay items cleared; delivery counts unchanged");
     FillFinalizeResponseLocked(response);
     cv_.notify_all();
 }
@@ -753,9 +723,10 @@ void SamplePoolCoordinator::FillStatusScalarsLocked(
         rejected_push_attempt_count_);
     response->set_rejected_transition_attempts(
         rejected_transition_attempts_);
-    response->set_acked_unique_transitions(acked_unique_transitions_);
+    response->set_acknowledged_transition_slot_count(
+        acknowledged_transition_slot_count_);
     response->set_acked_unique_deliveries(acked_unique_deliveries_);
-    response->set_ready_transitions(ready_transitions_);
+    response->set_ready_transitions(resident_transitions_);
     response->set_leased_transitions(
         has_lease_ ? lease_.transition_count : 0);
     response->set_resident_transitions(resident_transitions_);
@@ -764,7 +735,7 @@ void SamplePoolCoordinator::FillStatusScalarsLocked(
     response->set_capacity_transitions(config_.capacity_transitions);
     response->set_capacity_bytes(config_.capacity_bytes);
     response->set_pressure_state(PressureStateLocked());
-    response->set_redelivery_count(redelivery_count_);
+    response->set_released_transition_slot_count(released_transition_slot_count_);
     response->set_nack_count(nack_count_);
     response->set_expired_lease_count(expired_lease_count_);
     if (latest_ack_unix_ms_ > 0) {
@@ -787,20 +758,15 @@ void SamplePoolCoordinator::FillStatusScalarsLocked(
     response->set_active_consumer_count(has_lease_ ? 1 : 0);
     response->set_consumer_busy_count(consumer_busy_count_);
     response->set_ingress_ready(!finalized_);
-    response->set_pool_ready(ready_transitions_ > 0);
+    response->set_pool_ready(resident_transitions_ > 0);
     response->set_timestamp_unix_ms(NowMs());
-    if (!backend_->ready().empty()) {
-        const auto oldest = std::min_element(
-            backend_->ready().begin(), backend_->ready().end(),
-            [](const StoredTransition& left,
-               const StoredTransition& right) {
-                return left.insert_sequence < right.insert_sequence;
-            });
+    if (!backend_->resident().empty()) {
+        const auto& oldest = backend_->resident().front();
         response->set_oldest_ready_transition_age_ms(
-            NowMs() - oldest->inserted_at_unix_ms);
+            NowMs() - oldest.inserted_at_unix_ms);
         uint64_t minimum_step = std::numeric_limits<uint64_t>::max();
         uint64_t maximum_step = 0;
-        for (const auto& item : backend_->ready()) {
+        for (const auto& item : backend_->resident()) {
             minimum_step = std::min(
                 minimum_step,
                 item.transition.behavior_model_step());

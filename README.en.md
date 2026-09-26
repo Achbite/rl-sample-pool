@@ -42,25 +42,39 @@ selected artifacts into Learner. Component builds do not require this workspace 
 
 ## 4. Run it directly
 
-The current backend stores independent processed transitions. A training
-draw samples READY items uniformly without replacement; TRAINED ACK deletes
-them, NACK restores READY, and capacity pressure evicts only the oldest READY
-items in FIFO order. Behavior `model_step` is provenance rather than a stale
-admission gate, and producer envelopes, GAE segments, and Learner batches remain
-distinct units. `action_mask` is stored and delivered unchanged like every other
-sample field. Sample Pool does not interpret task action semantics or require masks
-to be enabled.
+The backend is a non-destructive Replay Pool: inserted samples remain resident,
+while draws return independent batch snapshots. `sampling.strategy` defaults to
+`uniform_without_replacement`, preventing duplicate item IDs only within a batch.
+`uniform_with_replacement` allows repeated slots. Both modes allow reuse across
+batches and retain the existing readiness threshold of at least
+`requested_transitions` resident items before delivering a complete batch.
 
-Each `SamplePoolItem` retains the complete `behavior_model` and `producer` from
-its accepted envelope, including across lease delivery, NACK and expiry. READY /
-resident byte accounting includes the serialized transition and both source
-fields. The
-Learner checks the actual model source; the Pool never reconstructs provenance
-from a local model, step or latest publication. Under its lock, `GetBatch` checks
-cancellation and the request deadline before handling READY samples and again
-after drawing, before creating a lease. An aborted draw restores the original
-READY order and counters; committed leases retain the existing ACK/NACK/expiry
-contract.
+ACK, NACK and lease expiry settle only the batch. They never remove, reinsert or
+refresh resident items. FIFO capacity eviction follows original insertion order,
+including items used by an in-flight batch; delivered snapshots remain unchanged.
+`ready_transitions` is the eligible resident count, while `leased_transitions`
+counts independent in-flight batch slots. They are not disjoint storage partitions.
+The existing single in-flight batch limit remains; this adds no parallel Learners.
+
+Each `SamplePoolItem` retains its original item ID, complete behavior model,
+producer and insertion facts. `draw_count` counts cumulative committed draw slots;
+repeated slots in a batch share the same end-of-batch snapshot. Resident byte
+accounting includes the transition and both source fields, not consumer snapshots.
+The Pool does not interpret task, action-mask or model compatibility semantics,
+apply staleness gates, recompute GAE or reconstruct provenance.
+
+Under its lock, `GetBatch` checks cancellation/deadline before selection and before
+committing draw history and the delivery lease. Cancelled selections leave resident
+order and counters untouched. TRAINED/INVALID/SHUTDOWN_UNTRAINED count explicitly
+acknowledged batch slots. `acknowledged_transition_slot_count` totals ACKed slots;
+`released_transition_slot_count` counts NACK/expired slots. Finalization clears
+residents into `finalized_transition_count`, not SHUTDOWN_UNTRAINED. Accounting is:
+
+```text
+accepted_unique = resident + evicted + finalized
+drawn_slots = acknowledged_slots + released_slots + leased_slots
+acknowledged_slots = trained + invalid + shutdown_untrained
+```
 
 ```bash
 # When build/maze_sample_pool already exists

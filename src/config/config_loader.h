@@ -3,12 +3,18 @@
 #include <cstdint>
 #include <string>
 
+enum class SamplingStrategy {
+    UniformWithoutReplacement,
+    UniformWithReplacement,
+};
+
 struct SamplePoolConfig {
     int listen_port = 9100;
     std::string backend_type = "local_memory";
     int64_t capacity_transitions = 10240;
     int64_t capacity_bytes = 536870912;
     uint64_t sampling_seed = 0;
+    SamplingStrategy sampling_strategy = SamplingStrategy::UniformWithoutReplacement;
     int64_t max_dedup_entries = 1000000;
     double high_watermark_ratio = 0.8;
     int default_get_timeout_ms = 1000;
